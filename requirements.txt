@@ -1,0 +1,7 @@
+streamlit
+torch
+opencv-python
+gdown
+python-dotenv
+mediapipe
+openai

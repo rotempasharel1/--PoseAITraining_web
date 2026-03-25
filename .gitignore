@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+outputs/
+temp_gdrive/
+.env
+*.pt
+*.csv
+*.mp4
+*.MOV
+*.mov
+*.avi
+*.mkv
+*.webm
+*.mpeg
+*.mpg
