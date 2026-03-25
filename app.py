@@ -12,8 +12,17 @@ import streamlit as st
 st.set_page_config(page_title="PoseAITraining", page_icon="🏋️", layout="centered")
 
 from backend import SquatAnalyzer, count_labeled_videos, download_gdrive_folder
-from main import MODEL_META_PATH, MODEL_PATH, ROOT, TRAINING_SUMMARY_PATH, is_model_ready, run_training_pipeline
-
+from main import (
+    MODEL_META_PATH,
+    MODEL_PATH,
+    ROOT,
+    TRAINING_SUMMARY_PATH,
+    POSE_GRU_PATH,
+    POSE_GRU_META_PATH,
+    is_model_ready,
+    run_training_pipeline,
+    run_pose_training_pipeline,
+)
 DEFAULT_GDRIVE_LINK = "https://drive.google.com/drive/folders/1CSGl4Y7hiTEJ9UuzwMe562WKmXbcvTAD?usp=drive_link"
 
 st.markdown(
@@ -58,6 +67,18 @@ st.markdown(
         border-radius: 15px !important;
     }
 
+    div[data-testid="stFileUploader"] button {
+        color: #000000 !important;
+        font-weight: 600 !important;
+        background-color: #ffffff !important;
+    }
+
+    .stTextInput input {
+        color: #000000 !important;
+        background-color: #ffffff !important;
+        font-weight: 500;
+    }
+
     .result-card {
         padding: 20px;
         border-radius: 16px;
@@ -96,11 +117,13 @@ st.markdown(
     }
 
     .mini-card {
-        background: rgba(255,255,255,0.06);
+        background: rgba(255, 255, 255, 0.85);
+        color: rgba(0, 0, 0, 0.9);
         padding: 16px;
         border-radius: 16px;
-        border: 1px solid rgba(255,255,255,0.18);
+        border: 1px solid rgba(255,255,255,0.4);
         margin-top: 14px;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.15);
     }
 </style>
 """,
@@ -167,7 +190,7 @@ def render_result(result: dict) -> None:
 
 
 def cleanup_old_outputs() -> None:
-    for path in [MODEL_PATH, MODEL_META_PATH, TRAINING_SUMMARY_PATH]:
+    for path in [MODEL_PATH, MODEL_META_PATH, TRAINING_SUMMARY_PATH, POSE_GRU_PATH, POSE_GRU_META_PATH]:
         if path.exists():
             try:
                 path.unlink()
@@ -194,20 +217,6 @@ if not is_model_ready():
         "Google Drive folder link",
         value=DEFAULT_GDRIVE_LINK,
         placeholder="Paste a Drive folder that contains good/ and bad/ videos",
-    )
-
-    st.markdown(
-        """
-        <div class="mini-card">
-            <b>Expected folder structure</b><br><br>
-            root/<br>
-            &nbsp;&nbsp;good/<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;video1.mp4<br>
-            &nbsp;&nbsp;bad/<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;video2.mp4
-        </div>
-        """,
-        unsafe_allow_html=True,
     )
 
     if st.button("Train model", type="primary", use_container_width=True):
@@ -255,7 +264,13 @@ if not is_model_ready():
 
             st.success(f"Found {counts['good']} good videos and {counts['bad']} bad videos.")
 
-            with st.spinner("Training the whole-video model..."):
+            with st.spinner("Training the side-view pose model... (This is fast)"):
+                try:
+                    run_pose_training_pipeline(temp_gdrive)
+                except Exception as e:
+                    st.warning(f"Pose model training skipped: {e}")
+
+            with st.spinner("Training the whole-video backup model..."):
                 model_path = run_training_pipeline(temp_gdrive)
 
             if not Path(model_path).exists() or not is_model_ready(model_path):
@@ -277,7 +292,9 @@ else:
     uploaded_file = st.file_uploader("Upload squat video", type=["mp4", "mov", "avi", "mkv", "webm"])
 
     if uploaded_file is not None:
-        st.video(uploaded_file)
+        _, center_col, _ = st.columns([1, 2, 1])
+        with center_col:
+            st.video(uploaded_file)
 
         if st.button("Analyze video", type="primary", use_container_width=True):
             temp_path = None

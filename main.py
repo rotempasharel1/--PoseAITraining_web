@@ -640,7 +640,9 @@ def llm_feedback_for_row(
     try:
         system_msg = (
             "You are a helpful squat coach. The classification was produced from a whole-video spatiotemporal model, not per-frame voting. "
-            "Return concise coaching feedback in English only."
+            "Return concise coaching feedback in English only. "
+            "CRITICAL: You must ALWAYS explicitly include feedback about the user's KNEES (e.g. tracking, alignment) and BACK/TORSO (e.g. leaning, posture), "
+            "whether they performed well or need to improve them."
         )
         metrics_text = json.dumps(metrics or {}, ensure_ascii=False)
         user_msg = f"""
@@ -653,8 +655,8 @@ Context:
 
 Task:
 Return strict JSON with these keys only:
-- llm_keep: 2 short points separated by ' ; '
-- llm_improve: 2 short points separated by ' ; '
+- llm_keep: 2 short points separated by ' ; '. At least one point MUST be about the back or knees if they were good.
+- llm_improve: 2 short points separated by ' ; '. At least one point MUST be about the back or knees if they need improvement.
 """
 
         schema = {
