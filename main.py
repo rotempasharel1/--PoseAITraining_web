@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import csv
@@ -22,10 +23,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
 try:
     from openai import OpenAI
 except Exception:  # pragma: no cover
     OpenAI = None
+
+try:
+    from torchvision.models.video import r3d_18, R3D_18_Weights
+except Exception:  # pragma: no cover
+    r3d_18 = None
+    R3D_18_Weights = None
+
 
 # ============================================================
 # Paths / env
@@ -44,23 +53,24 @@ TRAINING_SUMMARY_PATH = OUTPUT_DIR / "training_summary.json"
 TRAINING_CSV_PATH = OUTPUT_DIR / "training_accuracy.csv"
 TRAINING_PLOT_PATH = OUTPUT_DIR / "training_accuracy.png"
 SUMMARY_PLOT_PATH = OUTPUT_DIR / "model_summary.png"
+
 POSE_GRU_PATH = OUTPUT_DIR / "pose_gru_model.pt"
 POSE_GRU_META_PATH = OUTPUT_DIR / "pose_gru_meta.json"
 
 # Landmark indices for side-view squat analysis (MediaPipe Pose)
-# Left side: shoulder, hip, knee, ankle, heel, foot_index
 _SIDE_LANDMARKS = [11, 23, 25, 27, 29, 31]
 _POSE_FEATURES = len(_SIDE_LANDMARKS) * 2  # x, y per landmark (normalized)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg"}
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# Kinetics-400 normalization, commonly used with pretrained video backbones.
+_VIDEO_MEAN = np.array([0.43216, 0.394666, 0.37645], dtype=np.float32)
+_VIDEO_STD = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)
 
 
 # ============================================================
-# Config
+# Config helpers
 # ============================================================
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name, "").strip()
@@ -83,19 +93,31 @@ def _env_bool(name: str, default: bool) -> bool:
 class CFG:
     seed: int = _env_int("SEED", 42)
     val_ratio: float = _env_float("VAL_RATIO", 0.25)
-    clip_len: int = _env_int("CLIP_LEN", 16)
+
+    clip_len: int = _env_int("CLIP_LEN", 24)
     clip_stride: int = _env_int("CLIP_STRIDE", 2)
     image_size: int = _env_int("IMAGE_SIZE", 112)
-    batch_size: int = _env_int("BATCH_SIZE", 2)
+
+    batch_size: int = _env_int("BATCH_SIZE", 4)
     num_workers: int = _env_int("NUM_WORKERS", 0)
-    epochs: int = _env_int("EPOCHS", 4)
-    learning_rate: float = _env_float("LEARNING_RATE", 1e-4)
+
+    epochs: int = _env_int("EPOCHS", 25)
+    learning_rate: float = _env_float("LEARNING_RATE", 3e-4)
     weight_decay: float = _env_float("WEIGHT_DECAY", 1e-4)
-    early_stop_patience: int = _env_int("EARLY_STOP_PATIENCE", 3)
-    train_clips_per_video: int = _env_int("TRAIN_CLIPS_PER_VIDEO", 8)
-    val_clips_per_video: int = _env_int("VAL_CLIPS_PER_VIDEO", 2)
+    label_smoothing: float = _env_float("LABEL_SMOOTHING", 0.05)
+    early_stop_patience: int = _env_int("EARLY_STOP_PATIENCE", 6)
+
+    train_clips_per_video: int = _env_int("TRAIN_CLIPS_PER_VIDEO", 16)
+    val_clips_per_video: int = _env_int("VAL_CLIPS_PER_VIDEO", 4)
     max_eval_clips: int = _env_int("MAX_EVAL_CLIPS", 6)
-    use_pretrained_backbone: bool = _env_bool("USE_PRETRAINED_BACKBONE", False)
+
+    use_pretrained_backbone: bool = _env_bool("USE_PRETRAINED_BACKBONE", True)
+
+    pose_frames: int = _env_int("POSE_FRAMES", 32)
+    pose_hidden_size: int = _env_int("POSE_HIDDEN_SIZE", 64)
+    pose_layers: int = _env_int("POSE_LAYERS", 2)
+    pose_dropout: float = _env_float("POSE_DROPOUT", 0.35)
+    pose_learning_rate: float = _env_float("POSE_LEARNING_RATE", 1e-3)
 
 
 cfg = CFG()
@@ -195,7 +217,14 @@ def get_video_frame_count(video_path: str | Path) -> int:
     return max(total, 0)
 
 
-def _sample_indices(total_frames: int, clip_len: int, stride: int, *, center: bool, start_idx: Optional[int]) -> List[int]:
+def _sample_indices(
+    total_frames: int,
+    clip_len: int,
+    stride: int,
+    *,
+    center: bool,
+    start_idx: Optional[int],
+) -> List[int]:
     if total_frames <= 0:
         raise RuntimeError("Could not read the video or the video has zero frames.")
 
@@ -236,7 +265,6 @@ def load_video_clip(
 
     if total_frames <= 0:
         cap.release()
-        # Fallback: sequential read to count frames
         cap = cv2.VideoCapture(video_path)
         fallback_frames: List[np.ndarray] = []
         while True:
@@ -247,10 +275,22 @@ def load_video_clip(
         cap.release()
         if not fallback_frames:
             raise RuntimeError(f"Could not decode video: {video_path}")
-        indices = _sample_indices(len(fallback_frames), clip_len, stride, center=center, start_idx=start_idx)
+        indices = _sample_indices(
+            len(fallback_frames),
+            clip_len,
+            stride,
+            center=center,
+            start_idx=start_idx,
+        )
         frames = [_resize_rgb(fallback_frames[idx], image_size) for idx in indices]
     else:
-        indices = _sample_indices(total_frames, clip_len, stride, center=center, start_idx=start_idx)
+        indices = _sample_indices(
+            total_frames,
+            clip_len,
+            stride,
+            center=center,
+            start_idx=start_idx,
+        )
         wanted = set(indices)
         frames_by_idx: Dict[int, np.ndarray] = {}
         current = 0
@@ -277,7 +317,7 @@ def load_video_clip(
             frames.append(last_frame)
 
     clip = np.stack(frames, axis=0).astype(np.float32) / 255.0  # T,H,W,C
-    clip = (clip - _IMAGENET_MEAN) / _IMAGENET_STD
+    clip = (clip - _VIDEO_MEAN) / _VIDEO_STD
     clip = np.transpose(clip, (3, 0, 1, 2))  # C,T,H,W
     return torch.from_numpy(clip)
 
@@ -318,7 +358,9 @@ class VideoClipDataset(Dataset):
             start_idx=None,
         )
         if self.train and random.random() < 0.5:
-            clip = torch.flip(clip, dims=[3])
+            clip = torch.flip(clip, dims=[3])  # horizontal flip
+        if self.train and random.random() < 0.25:
+            clip = clip + (0.01 * torch.randn_like(clip))
         label = CLASS_TO_IDX[str(item["label"]).lower()]
         return clip, label
 
@@ -327,6 +369,8 @@ class VideoClipDataset(Dataset):
 # Model
 # ============================================================
 class VideoClassifier3D(nn.Module):
+    """Fallback lightweight 3D CNN when torchvision video models are unavailable."""
+
     def __init__(self, num_classes: int = 2) -> None:
         super().__init__()
         self.features = nn.Sequential(
@@ -362,8 +406,14 @@ class VideoClassifier3D(nn.Module):
 
 
 def build_model(pretrained: bool = False, device: str = DEVICE) -> nn.Module:
-    # pretrained is kept for API compatibility with the old project structure.
-    model = VideoClassifier3D(num_classes=len(CLASS_NAMES))
+    if r3d_18 is not None:
+        weights = None
+        if pretrained and R3D_18_Weights is not None:
+            weights = R3D_18_Weights.DEFAULT
+        model = r3d_18(weights=weights)
+        model.fc = nn.Linear(model.fc.in_features, len(CLASS_NAMES))
+    else:
+        model = VideoClassifier3D(num_classes=len(CLASS_NAMES))
     model.to(device)
     return model
 
@@ -371,7 +421,11 @@ def build_model(pretrained: bool = False, device: str = DEVICE) -> nn.Module:
 # ============================================================
 # Split / train helpers
 # ============================================================
-def _split_entries(entries: Sequence[Dict[str, Any]], val_ratio: float, seed: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _split_entries(
+    entries: Sequence[Dict[str, Any]],
+    val_ratio: float,
+    seed: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     rng = random.Random(seed)
     by_label: Dict[str, List[Dict[str, Any]]] = {"good": [], "bad": []}
     for item in entries:
@@ -380,7 +434,7 @@ def _split_entries(entries: Sequence[Dict[str, Any]], val_ratio: float, seed: in
     train_entries: List[Dict[str, Any]] = []
     val_entries: List[Dict[str, Any]] = []
 
-    for label, items in by_label.items():
+    for _label, items in by_label.items():
         if not items:
             continue
         rng.shuffle(items)
@@ -397,7 +451,13 @@ def _split_entries(entries: Sequence[Dict[str, Any]], val_ratio: float, seed: in
     return train_entries, val_entries
 
 
-def _make_loader(dataset: Dataset, labels: Sequence[int], batch_size: int, num_workers: int, train: bool) -> DataLoader:
+def _make_loader(
+    dataset: Dataset,
+    labels: Sequence[int],
+    batch_size: int,
+    num_workers: int,
+    train: bool,
+) -> DataLoader:
     if train and labels:
         class_counts = np.bincount(np.array(labels), minlength=len(CLASS_NAMES))
         class_weights = np.array([1.0 / max(1, count) for count in class_counts], dtype=np.float32)
@@ -424,10 +484,10 @@ def _evaluate(model: nn.Module, loader: DataLoader, device: str) -> Dict[str, fl
     total_correct = 0
     total_samples = 0
 
-    for clips, labels in loader:
-        clips = clips.to(device)
+    for inputs, labels in loader:
+        inputs = inputs.to(device)
         labels = labels.to(device)
-        logits = model(clips)
+        logits = model(inputs)
         loss = criterion(logits, labels)
         preds = torch.argmax(logits, dim=1)
         total_loss += float(loss.item()) * labels.size(0)
@@ -442,17 +502,60 @@ def _evaluate(model: nn.Module, loader: DataLoader, device: str) -> Dict[str, fl
 
 @torch.no_grad()
 def _collect_predictions(model: nn.Module, loader: DataLoader, device: str) -> Tuple[List[int], List[int]]:
-    """Returns (all_true_labels, all_pred_labels) for every sample in loader."""
     all_true: List[int] = []
     all_pred: List[int] = []
     model.eval()
-    for clips, labels in loader:
-        clips = clips.to(device)
-        logits = model(clips)
+    for inputs, labels in loader:
+        inputs = inputs.to(device)
+        logits = model(inputs)
         preds = torch.argmax(logits, dim=1).cpu().tolist()
         all_pred.extend(preds)
         all_true.extend(labels.tolist())
     return all_true, all_pred
+
+
+@torch.no_grad()
+def _collect_logits_labels(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    logits_list: List[torch.Tensor] = []
+    labels_list: List[torch.Tensor] = []
+    model.eval()
+    for inputs, labels in loader:
+        inputs = inputs.to(device)
+        logits = model(inputs).detach().cpu()
+        logits_list.append(logits)
+        labels_list.append(labels.detach().cpu())
+    if not logits_list:
+        return None, None
+    return torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0)
+
+
+def _fit_temperature(logits: Optional[torch.Tensor], labels: Optional[torch.Tensor]) -> float:
+    if logits is None or labels is None or logits.numel() == 0:
+        return 1.0
+
+    logits = logits.float()
+    labels = labels.long()
+    temperature = nn.Parameter(torch.ones(1))
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.LBFGS([temperature], lr=0.1, max_iter=50)
+
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        temp = torch.clamp(temperature, min=0.5, max=5.0)
+        loss = criterion(logits / temp, labels)
+        loss.backward()
+        return loss
+
+    try:
+        optimizer.step(closure)
+        temp_value = float(torch.clamp(temperature.detach(), min=0.5, max=5.0).item())
+        return temp_value if math.isfinite(temp_value) else 1.0
+    except Exception:
+        return 1.0
 
 
 def _save_summary_plot(
@@ -463,7 +566,6 @@ def _save_summary_plot(
     history: List[Dict[str, float]],
     save_path: Path,
 ) -> None:
-    """Saves a 3-panel summary: confusion matrix, correct vs wrong donut, accuracy curve."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -482,10 +584,9 @@ def _save_summary_plot(
         fig = plt.figure(figsize=(14, 5), facecolor="#1a1a2e")
         gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.38)
 
-        # ── Panel 1: Confusion matrix ──────────────────────────────
         ax1 = fig.add_subplot(gs[0])
         cm_arr = np.array(cm, dtype=float)
-        im = ax1.imshow(cm_arr, cmap="Blues", vmin=0)
+        ax1.imshow(cm_arr, cmap="Blues", vmin=0)
         ax1.set_xticks(range(n))
         ax1.set_yticks(range(n))
         ax1.set_xticklabels([c.capitalize() for c in class_names], color="white", fontsize=11)
@@ -496,40 +597,38 @@ def _save_summary_plot(
         for i in range(n):
             for j in range(n):
                 val = int(cm[i][j])
-                color = "white" if cm_arr[i, j] > cm_arr.max() / 2 else "black"
+                color = "white" if cm_arr[i, j] > max(1.0, cm_arr.max()) / 2 else "black"
                 ax1.text(j, i, str(val), ha="center", va="center", color=color, fontsize=14, fontweight="bold")
         ax1.tick_params(colors="white")
-        for spine in ax1.spines.values():
-            spine.set_edgecolor("#444466")
 
-        # ── Panel 2: Donut correct vs wrong ────────────────────────
         ax2 = fig.add_subplot(gs[1])
         sizes = [correct, wrong] if total > 0 else [1, 0]
         colors = ["#4CAF50", "#F44336"]
-        wedges, _ = ax2.pie(
-            sizes, colors=colors, startangle=90,
+        ax2.pie(
+            sizes,
+            colors=colors,
+            startangle=90,
             wedgeprops=dict(width=0.5, edgecolor="#1a1a2e", linewidth=2),
         )
         pct = correct / max(total, 1) * 100
-        ax2.text(0, 0, f"{pct:.0f}%", ha="center", va="center",
-                 color="white", fontsize=22, fontweight="bold")
+        ax2.text(0, 0, f"{pct:.0f}%", ha="center", va="center", color="white", fontsize=22, fontweight="bold")
         ax2.set_title("Val Accuracy", color="white", fontsize=12, fontweight="bold")
         ax2.legend(
             [f"Correct ({correct})", f"Wrong ({wrong})"],
-            loc="lower center", bbox_to_anchor=(0.5, -0.18),
-            fontsize=9, frameon=False, labelcolor="white",
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.18),
+            fontsize=9,
+            frameon=False,
+            labelcolor="white",
         )
 
-        # ── Panel 3: Accuracy curve ────────────────────────────────
         ax3 = fig.add_subplot(gs[2])
         ax3.set_facecolor("#12122a")
-        for spine in ax3.spines.values():
-            spine.set_edgecolor("#444466")
         epochs_x = [int(r["epoch"]) for r in history]
         train_acc = [float(r["train_accuracy"]) * 100 for r in history]
-        val_acc   = [float(r["val_accuracy"])   * 100 for r in history]
+        val_acc = [float(r["val_accuracy"]) * 100 for r in history]
         ax3.plot(epochs_x, train_acc, marker="o", color="#4CAF50", label="Train", linewidth=2)
-        ax3.plot(epochs_x, val_acc,   marker="s", color="#2196F3", label="Val",   linewidth=2, linestyle="--")
+        ax3.plot(epochs_x, val_acc, marker="s", color="#2196F3", label="Val", linewidth=2, linestyle="--")
         ax3.set_ylim(0, 105)
         ax3.set_xlabel("Epoch", color="#aaaacc", fontsize=10)
         ax3.set_ylabel("Accuracy (%)", color="#aaaacc", fontsize=10)
@@ -540,12 +639,15 @@ def _save_summary_plot(
 
         fig.suptitle(
             f"Model Summary  |  Best val accuracy: {best_metric * 100:.1f}%",
-            color="white", fontsize=13, fontweight="bold", y=1.02,
+            color="white",
+            fontsize=13,
+            fontweight="bold",
+            y=1.02,
         )
         fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)
     except Exception:
-        pass  # matplotlib not available — skip
+        pass
 
 
 # ============================================================
@@ -559,7 +661,22 @@ def is_model_ready(model_path: Path | str = MODEL_PATH) -> bool:
         meta = json.loads(MODEL_META_PATH.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return meta.get("checkpoint_format") == "poseai_video_v1"
+    return meta.get("checkpoint_format") in {"poseai_video_v1", "poseai_video_v2"}
+
+
+def is_pose_model_ready(model_path: Path | str = POSE_GRU_PATH) -> bool:
+    model_path = Path(model_path)
+    if not model_path.exists() or not POSE_GRU_META_PATH.exists():
+        return False
+    try:
+        meta = json.loads(POSE_GRU_META_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return meta.get("checkpoint_format") in {"poseai_gru_v1", "poseai_gru_v2"}
+
+
+def is_any_model_ready() -> bool:
+    return is_model_ready() or is_pose_model_ready()
 
 
 # ============================================================
@@ -601,7 +718,9 @@ def _fallback_feedback(pred_label: str, confidence: float, metrics: Optional[Dic
 
     if not keep_points:
         keep_points.append(
-            "Good overall control through parts of the squat cycle." if pred_label == "good" else "You still show moments of useful control to build on."
+            "Good overall control through parts of the squat cycle."
+            if pred_label == "good"
+            else "You still show moments of useful control to build on."
         )
 
     if not improve_points:
@@ -639,10 +758,9 @@ def llm_feedback_for_row(
 
     try:
         system_msg = (
-            "You are a helpful squat coach. The classification was produced from a whole-video spatiotemporal model, not per-frame voting. "
+            "You are a helpful squat coach. The classification was produced from a whole-video model and/or a pose-sequence model. "
             "Return concise coaching feedback in English only. "
-            "CRITICAL: You must ALWAYS explicitly include feedback about the user's KNEES (e.g. tracking, alignment) and BACK/TORSO (e.g. leaning, posture), "
-            "whether they performed well or need to improve them."
+            "You must explicitly mention KNEES and BACK/TORSO in the feedback."
         )
         metrics_text = json.dumps(metrics or {}, ensure_ascii=False)
         user_msg = f"""
@@ -655,8 +773,8 @@ Context:
 
 Task:
 Return strict JSON with these keys only:
-- llm_keep: 2 short points separated by ' ; '. At least one point MUST be about the back or knees if they were good.
-- llm_improve: 2 short points separated by ' ; '. At least one point MUST be about the back or knees if they need improvement.
+- llm_keep: 2 short points separated by ' ; '
+- llm_improve: 2 short points separated by ' ; '
 """
 
         schema = {
@@ -707,22 +825,16 @@ Return strict JSON with these keys only:
 # ============================================================
 # Pose-sequence model (side-view squat GRU classifier)
 # ============================================================
-
 def _extract_pose_seq(
     video_path: str | Path,
     n_frames: int = 32,
     landmark_indices: List[int] = _SIDE_LANDMARKS,
 ) -> Optional[np.ndarray]:
-    """Extract normalized landmark sequence from a side-view squat video.
-
-    Returns ndarray of shape (n_frames, len(landmark_indices)*2) or None if
-    MediaPipe is unavailable or no pose is detected in the video.
-    """
     try:
-        import mediapipe as mp  # lazy import — may fail on unicode paths
+        import mediapipe as mp
         pose_sol = mp.solutions.pose.Pose(
             static_image_mode=False,
-            model_complexity=0,  # fastest
+            model_complexity=1,
             min_detection_confidence=0.4,
             min_tracking_confidence=0.4,
         )
@@ -732,7 +844,6 @@ def _extract_pose_seq(
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    # Sample n_frames evenly
     if total > 0:
         positions = np.linspace(0, total - 1, num=n_frames)
         wanted = {int(round(float(p))) for p in positions}
@@ -750,7 +861,6 @@ def _extract_pose_seq(
             res = pose_sol.process(frame_rgb)
             if res.pose_landmarks:
                 lm = res.pose_landmarks.landmark
-                # Normalize: origin = left hip (idx 23), scale = hip-to-shoulder dist
                 hip_x = float(lm[23].x)
                 hip_y = float(lm[23].y)
                 shoulder_y = float(lm[11].y)
@@ -771,19 +881,15 @@ def _extract_pose_seq(
     if not frames_lm:
         return None
 
-    # Build ordered sequence, carry last valid frame forward
-    ordered_keys = sorted(frames_lm.keys())
     seq: List[List[float]] = []
-    last = frames_lm[ordered_keys[0]]
+    last = frames_lm[min(frames_lm.keys())]
     wanted_sorted = sorted(wanted) if wanted else list(range(n_frames))
     for idx in wanted_sorted:
-        # find closest detected frame
         best = min(frames_lm.keys(), key=lambda k: abs(k - idx))
         if abs(best - idx) < 10:
             last = frames_lm[best]
         seq.append(last)
 
-    # Pad/truncate to exactly n_frames
     while len(seq) < n_frames:
         seq.append(seq[-1])
     seq = seq[:n_frames]
@@ -792,8 +898,6 @@ def _extract_pose_seq(
 
 
 class PoseSequenceDataset(Dataset):
-    """Dataset that feeds normalized pose-landmark sequences to the GRU model."""
-
     def __init__(
         self,
         entries: Sequence[Dict[str, Any]],
@@ -810,9 +914,7 @@ class PoseSequenceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         if idx not in self._cache:
-            self._cache[idx] = _extract_pose_seq(
-                self.entries[idx]["path"], self.n_frames
-            )
+            self._cache[idx] = _extract_pose_seq(self.entries[idx]["path"], self.n_frames)
         seq = self._cache[idx]
 
         if seq is None:
@@ -821,12 +923,9 @@ class PoseSequenceDataset(Dataset):
             seq = seq.copy()
 
         if self.augment:
-            # Horizontal flip: negate x-coords (even columns)
             if random.random() < 0.5:
                 seq[:, 0::2] = -seq[:, 0::2]
-            # Small landmark jitter (simulates measurement noise)
             seq += np.random.normal(0, 0.015, seq.shape).astype(np.float32)
-            # Temporal shift ±2 frames
             shift = random.randint(-2, 2)
             if shift > 0:
                 seq = np.concatenate([seq[shift:], np.tile(seq[-1:], (shift, 1))])
@@ -838,8 +937,6 @@ class PoseSequenceDataset(Dataset):
 
 
 class PoseGRUClassifier(nn.Module):
-    """Lightweight GRU that classifies squat quality from landmark sequences."""
-
     def __init__(
         self,
         input_size: int = _POSE_FEATURES,
@@ -850,7 +947,9 @@ class PoseGRUClassifier(nn.Module):
     ) -> None:
         super().__init__()
         self.gru = nn.GRU(
-            input_size, hidden, layers,
+            input_size,
+            hidden,
+            layers,
             batch_first=True,
             dropout=dropout if layers > 1 else 0.0,
         )
@@ -862,24 +961,15 @@ class PoseGRUClassifier(nn.Module):
             nn.Linear(32, num_classes),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: (B, T, F)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.gru(x)
-        return self.head(out[:, -1, :])  # use last timestep
+        return self.head(out[:, -1, :])
 
 
-def is_pose_model_ready(model_path: Path | str = POSE_GRU_PATH) -> bool:
-    model_path = Path(model_path)
-    if not model_path.exists() or not POSE_GRU_META_PATH.exists():
-        return False
-    try:
-        meta = json.loads(POSE_GRU_META_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    return meta.get("checkpoint_format") == "poseai_gru_v1"
-
-
+# ============================================================
+# Training pipelines
+# ============================================================
 def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[Path, float]:
-    """Train the pose-landmark GRU classifier. Returns (model_path, best_val_accuracy)."""
     data_root = Path(data_root) if data_root is not None else ROOT / "temp_gdrive"
     entries = collect_labeled_videos(data_root)
     counts = summarize_video_entries(entries)
@@ -895,10 +985,9 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
     if not train_entries:
         raise RuntimeError("Training split is empty.")
 
-    train_ds = PoseSequenceDataset(train_entries, augment=True)
-    val_ds = PoseSequenceDataset(val_entries, augment=False)
+    train_ds = PoseSequenceDataset(train_entries, n_frames=cfg.pose_frames, augment=True)
+    val_ds = PoseSequenceDataset(val_entries, n_frames=cfg.pose_frames, augment=False)
 
-    # Pre-extract all sequences (cache) — fail early if MediaPipe broken
     sample_seq, _ = train_ds[0]
     if sample_seq.abs().sum().item() == 0.0:
         raise RuntimeError(
@@ -907,15 +996,30 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
         )
 
     train_labels = [CLASS_TO_IDX[e["label"]] for e in train_entries]
-    batch = min(cfg.batch_size, 8)
+    batch = min(max(2, cfg.batch_size), 8)
     train_loader = _make_loader(train_ds, train_labels, batch, cfg.num_workers, train=True)
     val_loader = _make_loader(val_ds, [], batch, cfg.num_workers, train=False)
 
-    model = PoseGRUClassifier(num_classes=len(CLASS_NAMES))
-    model.to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-5)
+    model = PoseGRUClassifier(
+        input_size=_POSE_FEATURES,
+        hidden=cfg.pose_hidden_size,
+        layers=cfg.pose_layers,
+        num_classes=len(CLASS_NAMES),
+        dropout=cfg.pose_dropout,
+    ).to(DEVICE)
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.pose_learning_rate,
+        weight_decay=cfg.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=2,
+    )
 
     best_metric = -float("inf")
     best_state: Optional[Dict[str, torch.Tensor]] = None
@@ -933,14 +1037,18 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
+
             preds = torch.argmax(logits.detach(), dim=1)
             run_loss += float(loss.item()) * labels.size(0)
             run_correct += int((preds == labels).sum().item())
             run_samples += int(labels.size(0))
-        scheduler.step()
 
-        train_m = {"loss": run_loss / max(1, run_samples), "accuracy": run_correct / max(1, run_samples)}
+        train_m = {
+            "loss": run_loss / max(1, run_samples),
+            "accuracy": run_correct / max(1, run_samples),
+        }
         val_m = _evaluate(model, val_loader, DEVICE) if val_entries else {"loss": 0.0, "accuracy": 0.0}
+        scheduler.step(val_m["accuracy"])
         monitor = val_m["accuracy"] if val_entries else train_m["accuracy"]
 
         if monitor > best_metric:
@@ -950,13 +1058,15 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
         else:
             patience += 1
 
-        history.append({
-            "epoch": float(epoch),
-            "train_loss": float(train_m["loss"]),
-            "train_accuracy": float(train_m["accuracy"]),
-            "val_loss": float(val_m["loss"]),
-            "val_accuracy": float(val_m["accuracy"]),
-        })
+        history.append(
+            {
+                "epoch": float(epoch),
+                "train_loss": float(train_m["loss"]),
+                "train_accuracy": float(train_m["accuracy"]),
+                "val_loss": float(val_m["loss"]),
+                "val_accuracy": float(val_m["accuracy"]),
+            }
+        )
 
         if patience >= cfg.early_stop_patience:
             break
@@ -964,34 +1074,37 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
     if best_state is None:
         raise RuntimeError("Pose GRU training did not produce a valid model.")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    model.load_state_dict(best_state)
+    val_logits, val_labels = _collect_logits_labels(model, val_loader, DEVICE)
+    temperature = _fit_temperature(val_logits, val_labels)
+
     checkpoint = {
-        "checkpoint_format": "poseai_gru_v1",
+        "checkpoint_format": "poseai_gru_v2",
         "model_name": "pose_gru",
         "class_names": CLASS_NAMES,
         "class_to_idx": CLASS_TO_IDX,
-        "n_frames": 32,
+        "n_frames": cfg.pose_frames,
         "pose_features": _POSE_FEATURES,
         "side_landmarks": _SIDE_LANDMARKS,
+        "hidden": cfg.pose_hidden_size,
+        "layers": cfg.pose_layers,
+        "dropout": cfg.pose_dropout,
+        "temperature": temperature,
+        "best_accuracy": best_metric,
         "trained_at": datetime.utcnow().isoformat() + "Z",
         "train_videos": len(train_entries),
         "val_videos": len(val_entries),
         "video_counts": counts,
         "history": history,
         "model_state": best_state,
-        "best_accuracy": best_metric,
     }
     torch.save(checkpoint, POSE_GRU_PATH)
 
     meta = {k: v for k, v in checkpoint.items() if k != "model_state"}
     POSE_GRU_META_PATH.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
-
     return POSE_GRU_PATH, best_metric
 
 
-# ============================================================
-# Training entry point
-# ============================================================
 def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
     data_root = Path(data_root) if data_root is not None else ROOT / "temp_gdrive"
     entries = collect_labeled_videos(data_root)
@@ -1032,8 +1145,14 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
     val_loader = _make_loader(val_dataset, val_labels, cfg.batch_size, cfg.num_workers, train=False)
 
     model = build_model(pretrained=cfg.use_pretrained_backbone, device=DEVICE)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=2,
+    )
 
     history: List[Dict[str, float]] = []
     best_metric = -float("inf")
@@ -1074,6 +1193,7 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
             "accuracy": running_correct / max(1, running_samples),
         }
         val_metrics = _evaluate(model, val_loader, DEVICE) if len(val_entries) > 0 else {"loss": 0.0, "accuracy": 0.0}
+        scheduler.step(val_metrics["accuracy"])
 
         monitor_metric = val_metrics["accuracy"] if len(val_entries) > 0 else train_metrics["accuracy"]
         if monitor_metric > best_metric:
@@ -1099,40 +1219,34 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
     if best_state is None:
         raise RuntimeError("Training did not produce a valid model state.")
 
+    model.load_state_dict(best_state)
+    val_logits, val_labels = _collect_logits_labels(model, val_loader, DEVICE)
+    temperature = _fit_temperature(val_logits, val_labels)
+
     checkpoint = {
-        "checkpoint_format": "poseai_video_v1",
-        "model_name": "simple_3d_cnn",
+        "checkpoint_format": "poseai_video_v2",
+        "model_name": "r3d_18" if r3d_18 is not None else "simple_3d_cnn",
         "class_names": CLASS_NAMES,
         "class_to_idx": CLASS_TO_IDX,
         "clip_len": cfg.clip_len,
         "clip_stride": cfg.clip_stride,
         "image_size": cfg.image_size,
+        "temperature": temperature,
+        "use_pretrained_backbone": bool(cfg.use_pretrained_backbone and r3d_18 is not None),
         "device_trained": DEVICE,
         "trained_at": datetime.utcnow().isoformat() + "Z",
         "train_videos": len(train_entries),
         "val_videos": len(val_entries),
         "video_counts": counts,
         "history": history,
+        "best_accuracy": best_metric,
         "model_state": best_state,
     }
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, MODEL_PATH)
 
-    meta = {
-        "checkpoint_format": "poseai_video_v1",
-        "model_name": "simple_3d_cnn",
-        "class_names": CLASS_NAMES,
-        "clip_len": cfg.clip_len,
-        "clip_stride": cfg.clip_stride,
-        "image_size": cfg.image_size,
-        "device_trained": DEVICE,
-        "trained_at": checkpoint["trained_at"],
-        "train_videos": len(train_entries),
-        "val_videos": len(val_entries),
-        "video_counts": counts,
-        "best_accuracy": best_metric,
-    }
-    MODEL_META_PATH.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta = {k: v for k, v in checkpoint.items() if k != "model_state"}
+    MODEL_META_PATH.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
     TRAINING_HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
     TRAINING_SUMMARY_PATH.write_text(
         json.dumps(
@@ -1144,6 +1258,7 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
                 "meta": meta,
             },
             indent=2,
+            default=str,
         ),
         encoding="utf-8",
     )
@@ -1151,7 +1266,6 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
     if not MODEL_PATH.exists():
         raise RuntimeError("Training ended but pose_model.pt was not created inside outputs/.")
 
-    # --- Export accuracy CSV ---
     csv_fields = ["epoch", "train_loss", "train_accuracy", "val_loss", "val_accuracy"]
     with open(TRAINING_CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fields)
@@ -1159,10 +1273,9 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
         for row in history:
             writer.writerow({k: row.get(k, "") for k in csv_fields})
 
-    # --- Export accuracy plot ---
     try:
         import matplotlib
-        matplotlib.use("Agg")  # non-interactive backend
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
         epochs_x = [int(r["epoch"]) for r in history]
@@ -1182,12 +1295,11 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
         fig.savefig(TRAINING_PLOT_PATH, dpi=150)
         plt.close(fig)
     except Exception:
-        pass  # matplotlib not installed — skip plot
+        pass
 
-    # --- Export summary plot (confusion matrix + donut + accuracy curve) ---
     if val_entries:
-        val_true, val_pred = _collect_predictions(model, val_loader, DEVICE)
         model.load_state_dict(best_state)
+        val_true, val_pred = _collect_predictions(model, val_loader, DEVICE)
         _save_summary_plot(
             all_true=val_true,
             all_pred=val_pred,

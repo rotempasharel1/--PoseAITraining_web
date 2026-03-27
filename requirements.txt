@@ -1,6 +1,9 @@
 streamlit
 torch
+torchvision
 opencv-python
+numpy
+matplotlib
 gdown
 python-dotenv
 mediapipe

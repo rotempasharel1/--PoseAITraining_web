@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import os
@@ -19,10 +20,11 @@ from main import (
     TRAINING_SUMMARY_PATH,
     POSE_GRU_PATH,
     POSE_GRU_META_PATH,
-    is_model_ready,
+    is_any_model_ready,
     run_training_pipeline,
     run_pose_training_pipeline,
 )
+
 DEFAULT_GDRIVE_LINK = "https://drive.google.com/drive/folders/1CSGl4Y7hiTEJ9UuzwMe562WKmXbcvTAD?usp=drive_link"
 
 st.markdown(
@@ -41,7 +43,7 @@ st.markdown(
     }
 
     .block-container {
-        max-width: 760px;
+        max-width: 800px;
         background: rgba(255, 255, 255, 0.04);
         backdrop-filter: blur(10px);
         -webkit-backdrop-filter: blur(10px);
@@ -97,6 +99,11 @@ st.markdown(
         border: 1px solid rgba(255, 152, 0, 0.35);
     }
 
+    .warning-card {
+        background: rgba(255, 193, 7, 0.16);
+        border: 1px solid rgba(255, 193, 7, 0.35);
+    }
+
     .tip-card {
         background: rgba(255,255,255,0.06);
         padding: 18px;
@@ -125,6 +132,17 @@ st.markdown(
         margin-top: 14px;
         box-shadow: 0 4px 10px rgba(0,0,0,0.15);
     }
+
+    .stat-pill {
+        display: inline-block;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.10);
+        border: 1px solid rgba(255,255,255,0.18);
+        margin-right: 8px;
+        margin-bottom: 8px;
+        font-size: 14px;
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -137,7 +155,11 @@ def get_analyzer() -> SquatAnalyzer:
 
 
 def render_logo() -> None:
-    for candidate in [ROOT / "logo.png", ROOT / "a_logo_for_poseaitraining_features_a_muscular_ma.png", Path("logo.png")]:
+    for candidate in [
+        ROOT / "logo.png",
+        ROOT / "a_logo_for_poseaitraining_features_a_muscular_ma.png",
+        Path("logo.png"),
+    ]:
         if candidate.exists():
             _, center, _ = st.columns([1.3, 1, 1.3])
             with center:
@@ -145,16 +167,37 @@ def render_logo() -> None:
             return
 
 
+def _confidence_label_text(level: str) -> str:
+    level = (level or "").lower()
+    if level == "high":
+        return "High reliability"
+    if level == "medium":
+        return "Medium reliability"
+    return "Low reliability / borderline"
+
+
 def render_result(result: dict) -> None:
     prediction = result.get("prediction", "bad").lower()
     confidence = float(result.get("confidence", 0.0))
+    confidence_level = str(result.get("confidence_level", "low")).lower()
     keep_tip = result.get("primary_keep_tip") or "Keep your current control and consistency."
     improve_tip = result.get("primary_improve_tip") or "Focus on cleaner squat mechanics in the full movement."
+    agreement = float(result.get("agreement", 0.0))
+    model_name = result.get("video_model", "model")
+    model_sources = result.get("model_sources", [])
 
     is_good = prediction == "good"
     title = "✅ Good squat" if is_good else "❌ Needs improvement"
-    subtitle = f"Confidence: {confidence:.0%}"
-    css_class = "good-card" if is_good else "bad-card"
+
+    if confidence_level == "high":
+        subtitle = f"Confidence: {confidence:.0%} • High reliability"
+        css_class = "good-card" if is_good else "bad-card"
+    elif confidence_level == "medium":
+        subtitle = f"Confidence: {confidence:.0%} • Medium reliability"
+        css_class = "good-card" if is_good else "bad-card"
+    else:
+        subtitle = f"Confidence: {confidence:.0%} • Borderline result"
+        css_class = "warning-card"
 
     st.markdown(
         f"""
@@ -165,6 +208,20 @@ def render_result(result: dict) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    pill_html = ""
+    pill_html += f"<span class='stat-pill'>Agreement: {agreement:.0%}</span>"
+    pill_html += f"<span class='stat-pill'>Models: {', '.join(model_sources) if model_sources else model_name}</span>"
+    if result.get("clips_analyzed"):
+        pill_html += f"<span class='stat-pill'>Clips analyzed: {int(result['clips_analyzed'])}</span>"
+
+    st.markdown(pill_html, unsafe_allow_html=True)
+
+    if confidence_level == "low":
+        st.warning(
+            "This looks like a borderline video. The result may improve if you retrain with more examples "
+            "or use a cleaner side-view recording."
+        )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -188,9 +245,32 @@ def render_result(result: dict) -> None:
             unsafe_allow_html=True,
         )
 
+    probs = result.get("probabilities", {})
+    if probs:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.metric("Good probability", f"{float(probs.get('good', 0.0)):.0%}")
+        with col_b:
+            st.metric("Bad probability", f"{float(probs.get('bad', 0.0)):.0%}")
+
+    source_summary = result.get("source_summary") or []
+    if source_summary:
+        st.subheader("Model summary")
+        for src in source_summary:
+            st.markdown(
+                f"- **{src['name']}** → prediction: `{src['prediction']}`, "
+                f"confidence: `{float(src['confidence']):.0%}`, weight: `{float(src['weight']):.2f}`"
+            )
+
 
 def cleanup_old_outputs() -> None:
-    for path in [MODEL_PATH, MODEL_META_PATH, TRAINING_SUMMARY_PATH, POSE_GRU_PATH, POSE_GRU_META_PATH]:
+    for path in [
+        MODEL_PATH,
+        MODEL_META_PATH,
+        TRAINING_SUMMARY_PATH,
+        POSE_GRU_PATH,
+        POSE_GRU_META_PATH,
+    ]:
         if path.exists():
             try:
                 path.unlink()
@@ -210,8 +290,11 @@ render_logo()
 st.title("PoseAITraining")
 st.write("Upload your squat video and get one clear result with two short tips.")
 
-if not is_model_ready():
-    st.info("The model is not ready yet. Train it once, and after that the screen will stay simple.")
+if not is_any_model_ready():
+    st.info(
+        "No trained model was found yet. Train once from your labeled `good/` and `bad/` videos, "
+        "then the app will switch to upload mode."
+    )
 
     gdrive_link = st.text_input(
         "Google Drive folder link",
@@ -225,17 +308,14 @@ if not is_model_ready():
         try:
             cleanup_old_outputs()
 
-            # Check if we already have local videos — skip download if so
             existing_counts = count_labeled_videos(temp_gdrive) if temp_gdrive.exists() else {}
             if existing_counts.get("total", 0) >= 2:
                 st.info(
                     f"Using existing local data: "
                     f"{existing_counts.get('good', 0)} good, "
-                    f"{existing_counts.get('bad', 0)} bad videos. "
-                    f"(Delete the `temp_gdrive` folder to force a fresh download.)"
+                    f"{existing_counts.get('bad', 0)} bad videos."
                 )
             else:
-                # No local data — download from Drive
                 if temp_gdrive.exists():
                     shutil.rmtree(temp_gdrive)
 
@@ -243,13 +323,11 @@ if not is_model_ready():
                     try:
                         download_gdrive_folder(gdrive_link, str(temp_gdrive))
                     except Exception as dl_exc:
-                        # Partial download — check if we got enough videos anyway
                         counts_check = count_labeled_videos(temp_gdrive) if temp_gdrive.exists() else {}
                         if counts_check.get("total", 0) >= 2:
                             st.warning(
-                                f"Download stopped early ({dl_exc}), "
-                                f"but found {counts_check.get('good',0)} good and "
-                                f"{counts_check.get('bad',0)} bad videos — training on what was downloaded."
+                                f"Download stopped early ({dl_exc}), but enough files were found locally. "
+                                f"Training will continue on the downloaded subset."
                             )
                         else:
                             raise RuntimeError(f"Download failed and not enough videos were saved: {dl_exc}")
@@ -264,16 +342,17 @@ if not is_model_ready():
 
             st.success(f"Found {counts['good']} good videos and {counts['bad']} bad videos.")
 
-            with st.spinner("Training the side-view pose model... (This is fast)"):
+            with st.spinner("Training the pose model..."):
                 try:
-                    run_pose_training_pipeline(temp_gdrive)
-                except Exception as e:
-                    st.warning(f"Pose model training skipped: {e}")
+                    pose_path, pose_acc = run_pose_training_pipeline(temp_gdrive)
+                    st.success(f"Pose model saved: {Path(pose_path).name} • best val accuracy: {pose_acc:.1%}")
+                except Exception as exc:
+                    st.warning(f"Pose model training skipped: {exc}")
 
-            with st.spinner("Training the whole-video backup model..."):
+            with st.spinner("Training the video model..."):
                 model_path = run_training_pipeline(temp_gdrive)
 
-            if not Path(model_path).exists() or not is_model_ready(model_path):
+            if not Path(model_path).exists():
                 raise RuntimeError("Training finished, but the model file was not saved correctly.")
 
             training_succeeded = True
@@ -285,7 +364,6 @@ if not is_model_ready():
         except Exception as exc:
             st.error(f"Training failed: {exc}")
         finally:
-            # Only delete temp_gdrive on success — keep it on failure for retry
             if training_succeeded and temp_gdrive.exists():
                 shutil.rmtree(temp_gdrive, ignore_errors=True)
 else:
@@ -324,9 +402,8 @@ if st.session_state.get("last_result"):
 st.markdown(
     f"""
 <div class='quote-box'>
-    <h3 style='color: #72ffc1; font-style: italic; margin: 0; font-weight: 500;'>💪 \"{random.choice(quotes)}\"</h3>
+    <h3 style='color: #72ffc1; font-style: italic; margin: 0; font-weight: 500;'>💪 "{random.choice(quotes)}"</h3>
 </div>
 """,
     unsafe_allow_html=True,
 )
-

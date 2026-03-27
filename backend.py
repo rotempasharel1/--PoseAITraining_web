@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -29,6 +30,7 @@ from main import (
     build_model,
     collect_labeled_videos,
     get_video_frame_count,
+    is_any_model_ready,
     is_model_ready,
     is_pose_model_ready,
     llm_feedback_for_row,
@@ -56,7 +58,7 @@ def count_labeled_videos(data_root: str | Path) -> Dict[str, int]:
 
 def _load_checkpoint(model_path: str | Path) -> Dict[str, Any]:
     checkpoint = torch.load(str(model_path), map_location="cpu")
-    if isinstance(checkpoint, dict) and checkpoint.get("checkpoint_format") == "poseai_video_v1":
+    if isinstance(checkpoint, dict) and checkpoint.get("checkpoint_format") in {"poseai_video_v1", "poseai_video_v2"}:
         return checkpoint
     raise RuntimeError(
         "The saved model is not a valid whole-video checkpoint. Please retrain with the updated video-based pipeline."
@@ -76,6 +78,20 @@ def _safe_div(a: float, b: float) -> float:
     return a / b if abs(b) > 1e-6 else 0.0
 
 
+def _softmax_with_temperature(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    temperature = float(temperature) if temperature else 1.0
+    temperature = max(0.5, min(5.0, temperature))
+    return torch.softmax(logits / temperature, dim=-1)
+
+
+def _confidence_level(confidence: float, margin: float, agreement: float) -> str:
+    if confidence >= 0.85 and margin >= 0.45 and agreement >= 0.75:
+        return "high"
+    if confidence >= 0.65 and margin >= 0.20 and agreement >= 0.50:
+        return "medium"
+    return "low"
+
+
 class PoseMetricsExtractor:
     def __init__(self) -> None:
         self.available = mp is not None
@@ -89,9 +105,6 @@ class PoseMetricsExtractor:
                     min_tracking_confidence=0.5,
                 )
             except Exception:
-                # MediaPipe can fail when the .venv path contains unicode/special
-                # characters (e.g. Hebrew folder names). Pose metrics will be
-                # skipped; the video-based classification still works normally.
                 self.pose = None
 
     def close(self) -> None:
@@ -184,53 +197,67 @@ class SquatAnalyzer:
     def __init__(self, model_path: str | Path | None = None):
         self.device = DEVICE
         self.model_path = Path(model_path) if model_path is not None else MODEL_PATH
-        # --- Video CNN ---
+
         self.model = None
         self.checkpoint: Optional[Dict[str, Any]] = None
-        self.clip_len = 16
+        self.model_temperature = 1.0
+        self.clip_len = 24
         self.clip_stride = 2
         self.image_size = 112
-        # --- Pose GRU ---
+
         self.pose_gru: Optional[Any] = None
         self.pose_gru_meta: Optional[Dict[str, Any]] = None
-        # --- Shared ---
+        self.pose_temperature = 1.0
+        self.pose_frames = 32
+
         self.metrics_extractor = PoseMetricsExtractor()
         self.is_loaded = False
         self._load_model_if_available()
 
     def _load_model_if_available(self) -> None:
-        # Try pose GRU first (preferred for side-view squats)
+        self.is_loaded = False
+
         if is_pose_model_ready():
             try:
                 ckpt = torch.load(str(POSE_GRU_PATH), map_location="cpu")
                 gru = PoseGRUClassifier(
                     input_size=int(ckpt.get("pose_features", _POSE_FEATURES)),
+                    hidden=int(ckpt.get("hidden", 64) or 64),
+                    layers=int(ckpt.get("layers", 2) or 2),
                     num_classes=len(CLASS_NAMES),
+                    dropout=float(ckpt.get("dropout", 0.35) or 0.35),
                 )
                 gru.load_state_dict(ckpt["model_state"])
                 gru.eval()
                 self.pose_gru = gru.to(self.device)
                 self.pose_gru_meta = {k: v for k, v in ckpt.items() if k != "model_state"}
+                self.pose_temperature = float(ckpt.get("temperature", 1.0) or 1.0)
+                self.pose_frames = int(ckpt.get("n_frames", 32) or 32)
                 self.is_loaded = True
             except Exception:
                 self.pose_gru = None
+                self.pose_gru_meta = None
 
-        # Always try to load video CNN as backup
         if self.model_path.exists():
             try:
-                checkpoint = torch.load(str(self.model_path), map_location="cpu")
-                if isinstance(checkpoint, dict) and checkpoint.get("checkpoint_format") == "poseai_video_v1":
-                    self.checkpoint = checkpoint
-                    self.clip_len = int(checkpoint.get("clip_len", 16))
-                    self.clip_stride = int(checkpoint.get("clip_stride", 2))
-                    self.image_size = int(checkpoint.get("image_size", 112))
-                    m = build_model(pretrained=False, device=self.device)
-                    m.load_state_dict(checkpoint["model_state"])
-                    m.eval()
-                    self.model = m
-                    self.is_loaded = True
+                checkpoint = _load_checkpoint(self.model_path)
+                self.checkpoint = checkpoint
+                self.clip_len = int(checkpoint.get("clip_len", 24))
+                self.clip_stride = int(checkpoint.get("clip_stride", 2))
+                self.image_size = int(checkpoint.get("image_size", 112))
+                self.model_temperature = float(checkpoint.get("temperature", 1.0) or 1.0)
+
+                m = build_model(
+                    pretrained=bool(checkpoint.get("use_pretrained_backbone", False)),
+                    device=self.device,
+                )
+                m.load_state_dict(checkpoint["model_state"])
+                m.eval()
+                self.model = m
+                self.is_loaded = True
             except Exception:
-                pass
+                self.model = None
+                self.checkpoint = None
 
     def _select_clip_starts(self, total_frames: int) -> List[int]:
         if total_frames <= 0:
@@ -245,19 +272,40 @@ class SquatAnalyzer:
         starts = sorted({int(round(float(pos))) for pos in positions})
         return starts or [0]
 
-    def analyze_video(self, video_path: str | Path) -> Dict[str, Any]:
-        if not self.is_loaded:
-            self._load_model_if_available()
-        if not self.is_loaded or self.model is None:
-            return {"error": "Model not trained or not found. Please train the whole-video model first."}
+    def _pose_probs(self, video_path: str | Path) -> Optional[Dict[str, Any]]:
+        if self.pose_gru is None:
+            return None
+
+        seq = _extract_pose_seq(video_path, n_frames=self.pose_frames)
+        if seq is None:
+            return None
+
+        with torch.no_grad():
+            x = torch.from_numpy(seq).unsqueeze(0).to(self.device)
+            logits = self.pose_gru(x)
+            probs = _softmax_with_temperature(logits, self.pose_temperature).cpu().numpy()[0]
+
+        pred_idx = int(np.argmax(probs))
+        return {
+            "name": "pose_gru",
+            "probabilities": probs.tolist(),
+            "prediction": CLASS_NAMES[pred_idx],
+            "confidence": float(probs[pred_idx]),
+            "weight_hint": float(self.pose_gru_meta.get("best_accuracy", 0.75) if self.pose_gru_meta else 0.75),
+        }
+
+    def _video_probs(self, video_path: str | Path) -> Optional[Dict[str, Any]]:
+        if self.model is None:
+            return None
 
         total_frames = get_video_frame_count(video_path)
         clip_starts = self._select_clip_starts(total_frames)
         if not clip_starts:
-            return {"error": "Could not sample clips from the uploaded video."}
+            return None
 
-        good_probs: List[float] = []
         clip_results: List[Dict[str, Any]] = []
+        logits_list: List[torch.Tensor] = []
+        clip_votes: List[int] = []
 
         with torch.no_grad():
             for start in clip_starts:
@@ -271,20 +319,77 @@ class SquatAnalyzer:
                 ).unsqueeze(0)
                 clip = clip.to(self.device)
                 logits = self.model(clip)
-                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-                good_prob = float(probs[1])
-                good_probs.append(good_prob)
+                probs = _softmax_with_temperature(logits, self.model_temperature).cpu().numpy()[0]
+                pred_idx = int(np.argmax(probs))
+                clip_votes.append(pred_idx)
+                logits_list.append(logits.detach().cpu())
                 clip_results.append(
                     {
                         "start_frame": int(start),
-                        "good_probability": good_prob,
+                        "good_probability": float(probs[1]),
                         "bad_probability": float(probs[0]),
+                        "prediction": CLASS_NAMES[pred_idx],
                     }
                 )
 
-        avg_good = float(np.mean(good_probs)) if good_probs else 0.0
-        pred_label = "good" if avg_good >= 0.5 else "bad"
-        confidence = avg_good if pred_label == "good" else (1.0 - avg_good)
+        if not logits_list:
+            return None
+
+        mean_logits = torch.mean(torch.cat(logits_list, dim=0), dim=0, keepdim=True)
+        final_probs = _softmax_with_temperature(mean_logits, self.model_temperature).cpu().numpy()[0]
+        pred_idx = int(np.argmax(final_probs))
+
+        agreement = 0.0
+        if clip_votes:
+            agreement = float(sum(1 for vote in clip_votes if vote == pred_idx) / len(clip_votes))
+
+        best_acc = 0.65
+        if self.checkpoint is not None:
+            best_acc = float(self.checkpoint.get("best_accuracy", best_acc) or best_acc)
+
+        return {
+            "name": str(self.checkpoint.get("model_name", "video_model") if self.checkpoint else "video_model"),
+            "probabilities": final_probs.tolist(),
+            "prediction": CLASS_NAMES[pred_idx],
+            "confidence": float(final_probs[pred_idx]),
+            "clip_results": clip_results,
+            "clips_analyzed": len(clip_results),
+            "clip_agreement": agreement,
+            "weight_hint": best_acc,
+            "total_frames": total_frames,
+        }
+
+    def analyze_video(self, video_path: str | Path) -> Dict[str, Any]:
+        if not self.is_loaded:
+            self._load_model_if_available()
+        if not self.is_loaded or (self.model is None and self.pose_gru is None):
+            return {"error": "Model not trained or not found. Please train the project first."}
+
+        pose_result = self._pose_probs(video_path)
+        video_result = self._video_probs(video_path)
+
+        sources = [src for src in [pose_result, video_result] if src is not None]
+        if not sources:
+            return {"error": "Could not extract usable features from the uploaded video."}
+
+        weights = [max(0.1, float(src.get("weight_hint", 0.5))) for src in sources]
+        weight_sum = float(sum(weights))
+        normalized_weights = [w / weight_sum for w in weights]
+
+        final_probs = np.zeros(len(CLASS_NAMES), dtype=np.float32)
+        votes: List[str] = []
+        for src, weight in zip(sources, normalized_weights):
+            final_probs += np.array(src["probabilities"], dtype=np.float32) * weight
+            votes.append(str(src["prediction"]))
+            if "clip_results" in src:
+                votes.extend([str(item["prediction"]) for item in src["clip_results"]])
+
+        pred_idx = int(np.argmax(final_probs))
+        pred_label = CLASS_NAMES[pred_idx]
+        confidence = float(final_probs[pred_idx])
+        margin = float(abs(final_probs[1] - final_probs[0]))
+        agreement = float(sum(1 for vote in votes if vote == pred_label) / max(1, len(votes)))
+        confidence_level = _confidence_level(confidence, margin, agreement)
 
         metrics = self.metrics_extractor.extract(video_path)
         feedback = llm_feedback_for_row(
@@ -295,13 +400,35 @@ class SquatAnalyzer:
             metrics=metrics,
         )
 
+        model_sources = [src["name"] for src in sources]
+        source_summary = []
+        for src, weight in zip(sources, normalized_weights):
+            source_summary.append(
+                {
+                    "name": src["name"],
+                    "weight": round(float(weight), 3),
+                    "prediction": src["prediction"],
+                    "confidence": round(float(src["confidence"]), 4),
+                }
+            )
+
         result = {
             "prediction": pred_label,
             "confidence": confidence,
-            "video_model": "simple_3d_cnn",
-            "clips_analyzed": len(clip_results),
-            "clip_results": clip_results,
-            "total_frames": total_frames,
+            "confidence_level": confidence_level,
+            "agreement": agreement,
+            "margin": margin,
+            "probabilities": {
+                "bad": float(final_probs[0]),
+                "good": float(final_probs[1]),
+            },
+            "video_model": " + ".join(model_sources),
+            "model_sources": model_sources,
+            "source_summary": source_summary,
+            "clips_analyzed": int(video_result.get("clips_analyzed", 0)) if video_result else 0,
+            "clip_results": video_result.get("clip_results", []) if video_result else [],
+            "clip_agreement": float(video_result.get("clip_agreement", 0.0)) if video_result else 0.0,
+            "total_frames": int(video_result.get("total_frames", get_video_frame_count(video_path))) if video_result else get_video_frame_count(video_path),
             "metrics": metrics,
             "llm_keep": feedback["llm_keep"],
             "llm_improve": feedback["llm_improve"],
