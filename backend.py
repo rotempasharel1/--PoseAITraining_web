@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -35,6 +36,7 @@ from main import (
     is_pose_model_ready,
     llm_feedback_for_row,
     load_video_clip,
+    select_clip_starts_for_video,
     summarize_video_entries,
 )
 
@@ -44,11 +46,39 @@ except Exception:  # pragma: no cover
     mp = None
 
 
+_PROXY_ENV_KEYS = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+]
+
+
+@contextmanager
+def _without_proxy_env() -> Any:
+    previous = {key: os.environ.get(key) for key in _PROXY_ENV_KEYS + ["NO_PROXY", "no_proxy"]}
+    try:
+        for key in _PROXY_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ["NO_PROXY"] = "*"
+        os.environ["no_proxy"] = "*"
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def download_gdrive_folder(url: str, output_dir: str) -> None:
     if gdown is None:
         raise RuntimeError("gdown is not installed. Install it with: python -m pip install gdown")
     os.makedirs(output_dir, exist_ok=True)
-    gdown.download_folder(url, output=output_dir, quiet=False, use_cookies=False)
+    with _without_proxy_env():
+        gdown.download_folder(url, output=output_dir, quiet=False, use_cookies=False)
 
 
 def count_labeled_videos(data_root: str | Path) -> Dict[str, int]:
@@ -90,6 +120,16 @@ def _confidence_level(confidence: float, margin: float, agreement: float) -> str
     if confidence >= 0.65 and margin >= 0.20 and agreement >= 0.50:
         return "medium"
     return "low"
+
+
+def _source_reliability(meta: Optional[Dict[str, Any]], default_accuracy: float) -> float:
+    accuracy = float((meta or {}).get("reliability", -1.0))
+    if accuracy >= 0.0:
+        return min(1.0, max(0.0, accuracy))
+
+    best_accuracy = float((meta or {}).get("best_accuracy", default_accuracy) or default_accuracy)
+    reliability = (best_accuracy - 0.5) / 0.35
+    return min(1.0, max(0.0, reliability))
 
 
 class PoseMetricsExtractor:
@@ -250,6 +290,7 @@ class SquatAnalyzer:
                 m = build_model(
                     pretrained=bool(checkpoint.get("use_pretrained_backbone", False)),
                     device=self.device,
+                    freeze_backbone=bool(checkpoint.get("freeze_backbone", False)),
                 )
                 m.load_state_dict(checkpoint["model_state"])
                 m.eval()
@@ -260,17 +301,7 @@ class SquatAnalyzer:
                 self.checkpoint = None
 
     def _select_clip_starts(self, total_frames: int) -> List[int]:
-        if total_frames <= 0:
-            return [0]
-        clip_span = 1 + (self.clip_len - 1) * self.clip_stride
-        if total_frames <= clip_span:
-            return [0]
-
-        max_start = max(0, total_frames - clip_span)
-        num_clips = min(6, max(1, total_frames // max(clip_span // 2, 1)))
-        positions = np.linspace(0, max_start, num=num_clips)
-        starts = sorted({int(round(float(pos))) for pos in positions})
-        return starts or [0]
+        return select_clip_starts_for_video(total_frames, self.clip_len, self.clip_stride, max_clips=6)
 
     def _pose_probs(self, video_path: str | Path) -> Optional[Dict[str, Any]]:
         if self.pose_gru is None:
@@ -291,7 +322,7 @@ class SquatAnalyzer:
             "probabilities": probs.tolist(),
             "prediction": CLASS_NAMES[pred_idx],
             "confidence": float(probs[pred_idx]),
-            "weight_hint": float(self.pose_gru_meta.get("best_accuracy", 0.75) if self.pose_gru_meta else 0.75),
+            "weight_hint": _source_reliability(self.pose_gru_meta, 0.75),
         }
 
     def _video_probs(self, video_path: str | Path) -> Optional[Dict[str, Any]]:
@@ -355,7 +386,7 @@ class SquatAnalyzer:
             "clip_results": clip_results,
             "clips_analyzed": len(clip_results),
             "clip_agreement": agreement,
-            "weight_hint": best_acc,
+            "weight_hint": _source_reliability(self.checkpoint, best_acc),
             "total_frames": total_frames,
         }
 
@@ -372,8 +403,11 @@ class SquatAnalyzer:
         if not sources:
             return {"error": "Could not extract usable features from the uploaded video."}
 
-        weights = [max(0.1, float(src.get("weight_hint", 0.5))) for src in sources]
+        weights = [max(0.01, float(src.get("weight_hint", 0.0))) for src in sources]
         weight_sum = float(sum(weights))
+        if weight_sum <= 1e-6:
+            weights = [max(0.01, float(src.get("confidence", 0.5))) for src in sources]
+            weight_sum = float(sum(weights))
         normalized_weights = [w / weight_sum for w in weights]
 
         final_probs = np.zeros(len(CLASS_NAMES), dtype=np.float32)
@@ -389,6 +423,9 @@ class SquatAnalyzer:
         confidence = float(final_probs[pred_idx])
         margin = float(abs(final_probs[1] - final_probs[0]))
         agreement = float(sum(1 for vote in votes if vote == pred_label) / max(1, len(votes)))
+        reliability_score = float(sum(weight * float(src.get("weight_hint", 0.0)) for src, weight in zip(sources, normalized_weights)))
+        confidence *= 0.65 + (0.35 * max(0.0, min(1.0, reliability_score)))
+        confidence = min(0.99, max(0.01, confidence))
         confidence_level = _confidence_level(confidence, margin, agreement)
 
         metrics = self.metrics_extractor.extract(video_path)
@@ -407,6 +444,7 @@ class SquatAnalyzer:
                 {
                     "name": src["name"],
                     "weight": round(float(weight), 3),
+                    "reliability": round(float(src.get("weight_hint", 0.0)), 3),
                     "prediction": src["prediction"],
                     "confidence": round(float(src["confidence"]), 4),
                 }
