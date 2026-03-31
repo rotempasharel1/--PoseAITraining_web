@@ -28,6 +28,7 @@ from main import (
     _POSE_FEATURES,
     _SIDE_LANDMARKS,
     _extract_pose_seq,
+    build_pose_feature_sequence,
     build_model,
     collect_labeled_videos,
     get_video_frame_count,
@@ -247,6 +248,7 @@ class SquatAnalyzer:
 
         self.pose_gru: Optional[Any] = None
         self.pose_gru_meta: Optional[Dict[str, Any]] = None
+        self.pose_gru_members: List[Dict[str, Any]] = []
         self.pose_temperature = 1.0
         self.pose_frames = 32
 
@@ -260,23 +262,46 @@ class SquatAnalyzer:
         if is_pose_model_ready():
             try:
                 ckpt = torch.load(str(POSE_GRU_PATH), map_location="cpu")
-                gru = PoseGRUClassifier(
-                    input_size=int(ckpt.get("pose_features", _POSE_FEATURES)),
-                    hidden=int(ckpt.get("hidden", 64) or 64),
-                    layers=int(ckpt.get("layers", 2) or 2),
-                    num_classes=len(CLASS_NAMES),
-                    dropout=float(ckpt.get("dropout", 0.35) or 0.35),
-                )
-                gru.load_state_dict(ckpt["model_state"])
-                gru.eval()
-                self.pose_gru = gru.to(self.device)
-                self.pose_gru_meta = {k: v for k, v in ckpt.items() if k != "model_state"}
+                self.pose_gru_members = []
+                member_payloads = ckpt.get("members")
+                if isinstance(member_payloads, list) and member_payloads:
+                    for member_payload in member_payloads:
+                        gru = PoseGRUClassifier(
+                            input_size=int(ckpt.get("pose_features", _POSE_FEATURES)),
+                            hidden=int(ckpt.get("hidden", 64) or 64),
+                            layers=int(ckpt.get("layers", 2) or 2),
+                            num_classes=len(CLASS_NAMES),
+                            dropout=float(ckpt.get("dropout", 0.35) or 0.35),
+                        )
+                        gru.load_state_dict(member_payload["model_state"])
+                        gru.eval()
+                        self.pose_gru_members.append(
+                            {
+                                "model": gru.to(self.device),
+                                "temperature": float(member_payload.get("temperature", ckpt.get("temperature", 1.0)) or 1.0),
+                                "reliability": float(member_payload.get("reliability", member_payload.get("best_accuracy", 0.6)) or 0.6),
+                            }
+                        )
+                    self.pose_gru = self.pose_gru_members[0]["model"]
+                else:
+                    gru = PoseGRUClassifier(
+                        input_size=int(ckpt.get("pose_features", _POSE_FEATURES)),
+                        hidden=int(ckpt.get("hidden", 64) or 64),
+                        layers=int(ckpt.get("layers", 2) or 2),
+                        num_classes=len(CLASS_NAMES),
+                        dropout=float(ckpt.get("dropout", 0.35) or 0.35),
+                    )
+                    gru.load_state_dict(ckpt["model_state"])
+                    gru.eval()
+                    self.pose_gru = gru.to(self.device)
+                self.pose_gru_meta = {k: v for k, v in ckpt.items() if k not in {"model_state", "members"}}
                 self.pose_temperature = float(ckpt.get("temperature", 1.0) or 1.0)
                 self.pose_frames = int(ckpt.get("n_frames", 32) or 32)
                 self.is_loaded = True
             except Exception:
                 self.pose_gru = None
                 self.pose_gru_meta = None
+                self.pose_gru_members = []
 
         if self.model_path.exists():
             try:
@@ -307,18 +332,29 @@ class SquatAnalyzer:
         if self.pose_gru is None:
             return None
 
-        seq = _extract_pose_seq(video_path, n_frames=self.pose_frames)
-        if seq is None:
+        seq_coords = _extract_pose_seq(video_path, n_frames=self.pose_frames)
+        if seq_coords is None:
             return None
+        seq = build_pose_feature_sequence(seq_coords)
 
         with torch.no_grad():
             x = torch.from_numpy(seq).unsqueeze(0).to(self.device)
-            logits = self.pose_gru(x)
-            probs = _softmax_with_temperature(logits, self.pose_temperature).cpu().numpy()[0]
+            if self.pose_gru_members:
+                member_probs: List[np.ndarray] = []
+                member_weights: List[float] = []
+                for member in self.pose_gru_members:
+                    logits = member["model"](x)
+                    probs = _softmax_with_temperature(logits, float(member.get("temperature", 1.0))).cpu().numpy()[0]
+                    member_probs.append(probs)
+                    member_weights.append(max(0.01, _source_reliability({"reliability": member.get("reliability", 0.6)}, 0.6)))
+                probs = np.average(np.stack(member_probs, axis=0), axis=0, weights=np.array(member_weights, dtype=np.float32))
+            else:
+                logits = self.pose_gru(x)
+                probs = _softmax_with_temperature(logits, self.pose_temperature).cpu().numpy()[0]
 
         pred_idx = int(np.argmax(probs))
         return {
-            "name": "pose_gru",
+            "name": "pose_gru_ensemble" if self.pose_gru_members else "pose_gru",
             "probabilities": probs.tolist(),
             "prediction": CLASS_NAMES[pred_idx],
             "confidence": float(probs[pred_idx]),

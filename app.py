@@ -292,7 +292,7 @@ st.write("Upload your squat video and get one clear result with two short tips."
 
 if not is_any_model_ready():
     st.info(
-        "No trained model was found yet. Train once from your labeled `good/` and `bad/` videos, "
+        "No trained model was found yet. Train once from your labeled videos, "
         "then the app will switch to upload mode."
     )
 
@@ -344,8 +344,8 @@ if not is_any_model_ready():
 
             with st.spinner("Training the pose model..."):
                 try:
-                    pose_path, pose_acc = run_pose_training_pipeline(temp_gdrive)
-                    st.success(f"Pose model saved: {Path(pose_path).name} • best val accuracy: {pose_acc:.1%}")
+                    pose_path, _pose_acc = run_pose_training_pipeline(temp_gdrive)
+                    st.success(f"Pose model saved: {Path(pose_path).name}")
                 except Exception as exc:
                     st.warning(f"Pose model training skipped: {exc}")
 

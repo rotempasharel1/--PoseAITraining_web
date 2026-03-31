@@ -59,7 +59,9 @@ POSE_GRU_META_PATH = OUTPUT_DIR / "pose_gru_meta.json"
 
 # Landmark indices for side-view squat analysis (MediaPipe Pose)
 _SIDE_LANDMARKS = [11, 23, 25, 27, 29, 31]
-_POSE_FEATURES = len(_SIDE_LANDMARKS) * 2  # x, y per landmark (normalized)
+_POSE_COORD_FEATURES = len(_SIDE_LANDMARKS) * 2  # x, y per landmark (normalized)
+_POSE_DERIVED_FEATURES = 6
+_POSE_FEATURES = _POSE_COORD_FEATURES + _POSE_COORD_FEATURES + _POSE_DERIVED_FEATURES
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg"}
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -118,6 +120,7 @@ class CFG:
     pose_layers: int = _env_int("POSE_LAYERS", 2)
     pose_dropout: float = _env_float("POSE_DROPOUT", 0.35)
     pose_learning_rate: float = _env_float("POSE_LEARNING_RATE", 1e-3)
+    pose_ensemble_members: int = _env_int("POSE_ENSEMBLE_MEMBERS", 3)
 
 
 cfg = CFG()
@@ -477,6 +480,51 @@ def _split_entries(
     return train_entries, val_entries
 
 
+def _angle_feature(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
+    ab = a - b
+    cb = c - b
+    denom = (np.linalg.norm(ab, axis=1) * np.linalg.norm(cb, axis=1)) + 1e-6
+    cosine = np.sum(ab * cb, axis=1) / denom
+    cosine = np.clip(cosine, -1.0, 1.0)
+    return np.degrees(np.arccos(cosine)).astype(np.float32)
+
+
+def build_pose_feature_sequence(coords_seq: np.ndarray) -> np.ndarray:
+    if coords_seq.size == 0:
+        return np.zeros((0, _POSE_FEATURES), dtype=np.float32)
+
+    coords = coords_seq.astype(np.float32, copy=True)
+    delta = np.vstack([np.zeros((1, coords.shape[1]), dtype=np.float32), np.diff(coords, axis=0)])
+
+    shoulder = coords[:, 0:2]
+    hip = coords[:, 2:4]
+    knee = coords[:, 4:6]
+    ankle = coords[:, 6:8]
+    heel = coords[:, 8:10]
+    foot = coords[:, 10:12]
+
+    torso_lean = np.degrees(np.arctan2(np.abs(shoulder[:, 0] - hip[:, 0]), np.abs(shoulder[:, 1] - hip[:, 1]) + 1e-6))
+    hip_angle = _angle_feature(shoulder, hip, knee)
+    knee_angle = _angle_feature(hip, knee, ankle)
+    ankle_angle = _angle_feature(knee, ankle, foot)
+    knee_over_toe = knee[:, 0] - foot[:, 0]
+    hip_depth = hip[:, 1] - knee[:, 1]
+
+    derived = np.stack(
+        [
+            torso_lean / 45.0,
+            hip_angle / 180.0,
+            knee_angle / 180.0,
+            ankle_angle / 180.0,
+            knee_over_toe,
+            hip_depth,
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+    return np.concatenate([coords, delta, derived], axis=1).astype(np.float32)
+
+
 def _make_loader(
     dataset: Dataset,
     labels: Sequence[int],
@@ -830,7 +878,7 @@ def is_pose_model_ready(model_path: Path | str = POSE_GRU_PATH) -> bool:
         meta = json.loads(POSE_GRU_META_PATH.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return meta.get("checkpoint_format") in {"poseai_gru_v1", "poseai_gru_v2"}
+    return meta.get("checkpoint_format") in {"poseai_gru_v1", "poseai_gru_v2", "poseai_gru_v3"}
 
 
 def is_any_model_ready() -> bool:
@@ -1076,7 +1124,7 @@ class PoseSequenceDataset(Dataset):
         seq = self._cache[idx]
 
         if seq is None:
-            seq = np.zeros((self.n_frames, _POSE_FEATURES), dtype=np.float32)
+            seq = np.zeros((self.n_frames, _POSE_COORD_FEATURES), dtype=np.float32)
         else:
             seq = seq.copy()
 
@@ -1090,6 +1138,7 @@ class PoseSequenceDataset(Dataset):
             elif shift < 0:
                 seq = np.concatenate([np.tile(seq[:1], (-shift, 1)), seq[:shift]])
 
+        seq = build_pose_feature_sequence(seq)
         label = CLASS_TO_IDX[str(self.entries[idx]["label"]).lower()]
         return torch.from_numpy(seq), label
 
@@ -1127,21 +1176,13 @@ class PoseGRUClassifier(nn.Module):
 # ============================================================
 # Training pipelines
 # ============================================================
-def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[Path, float]:
-    data_root = Path(data_root) if data_root is not None else ROOT / "temp_gdrive"
-    entries = collect_labeled_videos(data_root)
-    counts = summarize_video_entries(entries)
-
-    if counts["good"] == 0:
-        raise RuntimeError("No GOOD videos found.")
-    if counts["bad"] == 0:
-        raise RuntimeError("No BAD videos found.")
-    if counts["total"] < 2:
-        raise RuntimeError("Need at least 2 videos.")
-
-    train_entries, val_entries = _split_entries(entries, cfg.val_ratio, cfg.seed)
-    if not train_entries:
-        raise RuntimeError("Training split is empty.")
+def _train_single_pose_model(
+    train_entries: Sequence[Dict[str, Any]],
+    val_entries: Sequence[Dict[str, Any]],
+    *,
+    split_seed: int,
+) -> Dict[str, Any]:
+    set_seed(split_seed)
 
     train_ds = PoseSequenceDataset(train_entries, n_frames=cfg.pose_frames, augment=True)
     val_ds = PoseSequenceDataset(val_entries, n_frames=cfg.pose_frames, augment=False)
@@ -1236,9 +1277,59 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
     val_logits, val_labels = _collect_logits_labels(model, val_loader, DEVICE)
     temperature = _fit_temperature(val_logits, val_labels)
 
+    return {
+        "split_seed": split_seed,
+        "train_videos": len(train_entries),
+        "val_videos": len(val_entries),
+        "best_accuracy": best_metric,
+        "reliability": _accuracy_to_reliability(best_metric),
+        "temperature": temperature,
+        "history": history,
+        "model_state": best_state,
+    }
+
+
+def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[Path, float]:
+    data_root = Path(data_root) if data_root is not None else ROOT / "temp_gdrive"
+    entries = collect_labeled_videos(data_root)
+    counts = summarize_video_entries(entries)
+
+    if counts["good"] == 0:
+        raise RuntimeError("No GOOD videos found.")
+    if counts["bad"] == 0:
+        raise RuntimeError("No BAD videos found.")
+    if counts["total"] < 2:
+        raise RuntimeError("Need at least 2 videos.")
+
+    members: List[Dict[str, Any]] = []
+    all_histories: List[Dict[str, Any]] = []
+    ensemble_members = max(1, min(cfg.pose_ensemble_members, 5))
+
+    for member_idx in range(ensemble_members):
+        split_seed = cfg.seed + (member_idx * 17)
+        train_entries, val_entries = _split_entries(entries, cfg.val_ratio, split_seed)
+        if not train_entries:
+            continue
+        member = _train_single_pose_model(train_entries, val_entries, split_seed=split_seed)
+        members.append(member)
+        all_histories.append(
+            {
+                "member_index": member_idx,
+                "split_seed": split_seed,
+                "history": member["history"],
+                "best_accuracy": member["best_accuracy"],
+            }
+        )
+
+    if not members:
+        raise RuntimeError("Pose ensemble training did not produce any valid model.")
+
+    best_metric = float(np.mean([float(member["best_accuracy"]) for member in members]))
+    reliability = float(np.mean([float(member["reliability"]) for member in members]))
+
     checkpoint = {
-        "checkpoint_format": "poseai_gru_v2",
-        "model_name": "pose_gru",
+        "checkpoint_format": "poseai_gru_v3",
+        "model_name": "pose_gru_ensemble",
         "class_names": CLASS_NAMES,
         "class_to_idx": CLASS_TO_IDX,
         "n_frames": cfg.pose_frames,
@@ -1247,19 +1338,21 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
         "hidden": cfg.pose_hidden_size,
         "layers": cfg.pose_layers,
         "dropout": cfg.pose_dropout,
-        "temperature": temperature,
+        "temperature": float(np.mean([float(member["temperature"]) for member in members])),
         "best_accuracy": best_metric,
-        "reliability": _accuracy_to_reliability(best_metric),
+        "reliability": reliability,
+        "ensemble_members": len(members),
         "trained_at": datetime.utcnow().isoformat() + "Z",
-        "train_videos": len(train_entries),
-        "val_videos": len(val_entries),
+        "train_videos": max(int(member["train_videos"]) for member in members),
+        "val_videos": max(int(member["val_videos"]) for member in members),
         "video_counts": counts,
-        "history": history,
-        "model_state": best_state,
+        "history": all_histories,
+        "members": members,
     }
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, POSE_GRU_PATH)
 
-    meta = {k: v for k, v in checkpoint.items() if k != "model_state"}
+    meta = {k: v for k, v in checkpoint.items() if k != "members"}
     POSE_GRU_META_PATH.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
     return POSE_GRU_PATH, best_metric
 
