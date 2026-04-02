@@ -24,11 +24,15 @@ from main import (
     OUTPUT_DIR,
     POSE_GRU_PATH,
     POSE_GRU_META_PATH,
+    POSE_TABULAR_PATH,
     PoseGRUClassifier,
+    PoseHybridClassifier,
+    PoseTabularClassifier,
     _POSE_FEATURES,
     _SIDE_LANDMARKS,
     _extract_pose_seq,
     build_pose_feature_sequence,
+    summarize_pose_feature_sequence,
     build_model,
     collect_labeled_videos,
     get_video_frame_count,
@@ -249,6 +253,8 @@ class SquatAnalyzer:
         self.pose_gru: Optional[Any] = None
         self.pose_gru_meta: Optional[Dict[str, Any]] = None
         self.pose_gru_members: List[Dict[str, Any]] = []
+        self.pose_tabular: Optional[Any] = None
+        self.pose_tabular_meta: Optional[Dict[str, Any]] = None
         self.pose_temperature = 1.0
         self.pose_frames = 32
 
@@ -262,11 +268,13 @@ class SquatAnalyzer:
         if is_pose_model_ready():
             try:
                 ckpt = torch.load(str(POSE_GRU_PATH), map_location="cpu")
+                pose_model_family = str(ckpt.get("model_family", "") or "")
+                pose_model_cls = PoseHybridClassifier if pose_model_family == "pose_hybrid_v1" else PoseGRUClassifier
                 self.pose_gru_members = []
                 member_payloads = ckpt.get("members")
                 if isinstance(member_payloads, list) and member_payloads:
                     for member_payload in member_payloads:
-                        gru = PoseGRUClassifier(
+                        gru = pose_model_cls(
                             input_size=int(ckpt.get("pose_features", _POSE_FEATURES)),
                             hidden=int(ckpt.get("hidden", 64) or 64),
                             layers=int(ckpt.get("layers", 2) or 2),
@@ -284,7 +292,7 @@ class SquatAnalyzer:
                         )
                     self.pose_gru = self.pose_gru_members[0]["model"]
                 else:
-                    gru = PoseGRUClassifier(
+                    gru = pose_model_cls(
                         input_size=int(ckpt.get("pose_features", _POSE_FEATURES)),
                         hidden=int(ckpt.get("hidden", 64) or 64),
                         layers=int(ckpt.get("layers", 2) or 2),
@@ -302,6 +310,24 @@ class SquatAnalyzer:
                 self.pose_gru = None
                 self.pose_gru_meta = None
                 self.pose_gru_members = []
+
+        if POSE_TABULAR_PATH.exists():
+            try:
+                ckpt = torch.load(str(POSE_TABULAR_PATH), map_location="cpu")
+                tab = PoseTabularClassifier(
+                    input_size=int(ckpt.get("input_size", _POSE_FEATURES * 4)),
+                    hidden=int(ckpt.get("hidden", 128) or 128),
+                    num_classes=len(CLASS_NAMES),
+                    dropout=0.2,
+                )
+                tab.load_state_dict(ckpt["model_state"])
+                tab.eval()
+                self.pose_tabular = tab.to(self.device)
+                self.pose_tabular_meta = ckpt
+                self.is_loaded = True
+            except Exception:
+                self.pose_tabular = None
+                self.pose_tabular_meta = None
 
         if self.model_path.exists():
             try:
@@ -359,6 +385,34 @@ class SquatAnalyzer:
             "prediction": CLASS_NAMES[pred_idx],
             "confidence": float(probs[pred_idx]),
             "weight_hint": _source_reliability(self.pose_gru_meta, 0.75),
+        }
+
+    def _pose_tabular_probs(self, video_path: str | Path) -> Optional[Dict[str, Any]]:
+        if self.pose_tabular is None or self.pose_tabular_meta is None:
+            return None
+
+        seq_coords = _extract_pose_seq(video_path, n_frames=self.pose_frames)
+        if seq_coords is None:
+            return None
+
+        feature_seq = build_pose_feature_sequence(seq_coords)
+        vector = summarize_pose_feature_sequence(feature_seq)
+        mean = np.asarray(self.pose_tabular_meta.get("feature_mean"), dtype=np.float32).reshape(-1)
+        std = np.asarray(self.pose_tabular_meta.get("feature_std"), dtype=np.float32).reshape(-1)
+        vector = (vector - mean) / (std + 1e-6)
+
+        with torch.no_grad():
+            x = torch.from_numpy(vector).unsqueeze(0).to(self.device)
+            logits = self.pose_tabular(x)
+            probs = _softmax_with_temperature(logits, float(self.pose_tabular_meta.get("temperature", 1.0))).cpu().numpy()[0]
+
+        pred_idx = int(np.argmax(probs))
+        return {
+            "name": "pose_tabular",
+            "probabilities": probs.tolist(),
+            "prediction": CLASS_NAMES[pred_idx],
+            "confidence": float(probs[pred_idx]),
+            "weight_hint": _source_reliability(self.pose_tabular_meta, 0.72),
         }
 
     def _video_probs(self, video_path: str | Path) -> Optional[Dict[str, Any]]:
@@ -433,9 +487,10 @@ class SquatAnalyzer:
             return {"error": "Model not trained or not found. Please train the project first."}
 
         pose_result = self._pose_probs(video_path)
+        pose_tabular_result = self._pose_tabular_probs(video_path)
         video_result = self._video_probs(video_path)
 
-        sources = [src for src in [pose_result, video_result] if src is not None]
+        sources = [src for src in [pose_result, pose_tabular_result, video_result] if src is not None]
         if not sources:
             return {"error": "Could not extract usable features from the uploaded video."}
 

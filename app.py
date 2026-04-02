@@ -20,6 +20,8 @@ from main import (
     TRAINING_SUMMARY_PATH,
     POSE_GRU_PATH,
     POSE_GRU_META_PATH,
+    POSE_TABULAR_PATH,
+    POSE_TABULAR_META_PATH,
     is_any_model_ready,
     run_training_pipeline,
     run_pose_training_pipeline,
@@ -270,6 +272,8 @@ def cleanup_old_outputs() -> None:
         TRAINING_SUMMARY_PATH,
         POSE_GRU_PATH,
         POSE_GRU_META_PATH,
+        POSE_TABULAR_PATH,
+        POSE_TABULAR_META_PATH,
     ]:
         if path.exists():
             try:

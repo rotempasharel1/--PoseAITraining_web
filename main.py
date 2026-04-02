@@ -56,6 +56,8 @@ SUMMARY_PLOT_PATH = OUTPUT_DIR / "model_summary.png"
 
 POSE_GRU_PATH = OUTPUT_DIR / "pose_gru_model.pt"
 POSE_GRU_META_PATH = OUTPUT_DIR / "pose_gru_meta.json"
+POSE_TABULAR_PATH = OUTPUT_DIR / "pose_tabular_model.pt"
+POSE_TABULAR_META_PATH = OUTPUT_DIR / "pose_tabular_meta.json"
 
 # Landmark indices for side-view squat analysis (MediaPipe Pose)
 _SIDE_LANDMARKS = [11, 23, 25, 27, 29, 31]
@@ -120,7 +122,7 @@ class CFG:
     pose_layers: int = _env_int("POSE_LAYERS", 2)
     pose_dropout: float = _env_float("POSE_DROPOUT", 0.35)
     pose_learning_rate: float = _env_float("POSE_LEARNING_RATE", 1e-3)
-    pose_ensemble_members: int = _env_int("POSE_ENSEMBLE_MEMBERS", 3)
+    pose_ensemble_members: int = _env_int("POSE_ENSEMBLE_MEMBERS", 5)
 
 
 cfg = CFG()
@@ -525,6 +527,16 @@ def build_pose_feature_sequence(coords_seq: np.ndarray) -> np.ndarray:
     return np.concatenate([coords, delta, derived], axis=1).astype(np.float32)
 
 
+def summarize_pose_feature_sequence(feature_seq: np.ndarray) -> np.ndarray:
+    if feature_seq.size == 0:
+        return np.zeros(_POSE_FEATURES * 4, dtype=np.float32)
+    mean = feature_seq.mean(axis=0)
+    std = feature_seq.std(axis=0)
+    min_v = feature_seq.min(axis=0)
+    max_v = feature_seq.max(axis=0)
+    return np.concatenate([mean, std, min_v, max_v], axis=0).astype(np.float32)
+
+
 def _make_loader(
     dataset: Dataset,
     labels: Sequence[int],
@@ -878,7 +890,7 @@ def is_pose_model_ready(model_path: Path | str = POSE_GRU_PATH) -> bool:
         meta = json.loads(POSE_GRU_META_PATH.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return meta.get("checkpoint_format") in {"poseai_gru_v1", "poseai_gru_v2", "poseai_gru_v3"}
+    return meta.get("checkpoint_format") in {"poseai_gru_v1", "poseai_gru_v2", "poseai_gru_v3", "poseai_gru_v4"}
 
 
 def is_any_model_ready() -> bool:
@@ -1173,6 +1185,69 @@ class PoseGRUClassifier(nn.Module):
         return self.head(out[:, -1, :])
 
 
+class PoseHybridClassifier(nn.Module):
+    def __init__(
+        self,
+        input_size: int = _POSE_FEATURES,
+        hidden: int = 64,
+        layers: int = 2,
+        num_classes: int = 2,
+        dropout: float = 0.35,
+    ) -> None:
+        super().__init__()
+        self.hidden = hidden
+        self.gru = nn.GRU(
+            input_size,
+            hidden,
+            layers,
+            batch_first=True,
+            dropout=dropout if layers > 1 else 0.0,
+            bidirectional=True,
+        )
+        self.attention = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden * 8),
+            nn.Dropout(dropout),
+            nn.Linear(hidden * 8, hidden * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout * 0.8),
+            nn.Linear(hidden * 2, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.gru(x)
+        attn_scores = self.attention(out).squeeze(-1)
+        attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1)
+        attn_pool = torch.sum(out * attn_weights, dim=1)
+        mean_pool = out.mean(dim=1)
+        max_pool = out.max(dim=1).values
+        std_pool = torch.sqrt(torch.var(out, dim=1, unbiased=False) + 1e-6)
+        fused = torch.cat([attn_pool, mean_pool, max_pool, std_pool], dim=1)
+        return self.head(fused)
+
+
+class PoseTabularClassifier(nn.Module):
+    def __init__(self, input_size: int, hidden: int = 128, num_classes: int = 2, dropout: float = 0.25) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_size),
+            nn.Linear(input_size, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout * 0.8),
+            nn.Linear(hidden // 2, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 # ============================================================
 # Training pipelines
 # ============================================================
@@ -1199,7 +1274,7 @@ def _train_single_pose_model(
     train_loader = _make_loader(train_ds, train_labels, batch, cfg.num_workers, train=True)
     val_loader = _make_loader(val_ds, [], batch, cfg.num_workers, train=False)
 
-    model = PoseGRUClassifier(
+    model = PoseHybridClassifier(
         input_size=_POSE_FEATURES,
         hidden=cfg.pose_hidden_size,
         layers=cfg.pose_layers,
@@ -1285,6 +1360,92 @@ def _train_single_pose_model(
         "reliability": _accuracy_to_reliability(best_metric),
         "temperature": temperature,
         "history": history,
+        "model_family": "pose_hybrid_v1",
+        "model_state": best_state,
+    }
+
+
+def _extract_pose_tabular_vector(video_path: str | Path, n_frames: int) -> Optional[np.ndarray]:
+    seq = _extract_pose_seq(video_path, n_frames=n_frames)
+    if seq is None:
+        return None
+    feature_seq = build_pose_feature_sequence(seq)
+    return summarize_pose_feature_sequence(feature_seq)
+
+
+def _train_pose_tabular_model(
+    entries: Sequence[Dict[str, Any]],
+    *,
+    n_frames: int,
+) -> Optional[Dict[str, Any]]:
+    vectors: List[np.ndarray] = []
+    labels: List[int] = []
+    for item in entries:
+        vec = _extract_pose_tabular_vector(item["path"], n_frames=n_frames)
+        if vec is None:
+            continue
+        vectors.append(vec)
+        labels.append(CLASS_TO_IDX[str(item["label"]).lower()])
+
+    if len(vectors) < 4 or len(set(labels)) < 2:
+        return None
+
+    x = np.stack(vectors).astype(np.float32)
+    y = np.array(labels, dtype=np.int64)
+    mean = x.mean(axis=0, keepdims=True)
+    std = x.std(axis=0, keepdims=True) + 1e-6
+    x = (x - mean) / std
+
+    x_tensor = torch.from_numpy(x).to(DEVICE)
+    y_tensor = torch.from_numpy(y).to(DEVICE)
+
+    model = PoseTabularClassifier(input_size=x.shape[1], hidden=128, num_classes=len(CLASS_NAMES), dropout=0.2).to(DEVICE)
+    criterion = nn.CrossEntropyLoss(label_smoothing=max(0.0, cfg.label_smoothing * 0.5))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=8e-4, weight_decay=1e-4)
+
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    best_acc = -float("inf")
+    history: List[Dict[str, float]] = []
+
+    for epoch in range(1, min(cfg.epochs, 20) + 1):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x_tensor)
+        loss = criterion(logits, y_tensor)
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            model.eval()
+            eval_logits = model(x_tensor)
+            preds = torch.argmax(eval_logits, dim=1)
+            acc = float((preds == y_tensor).float().mean().item())
+            history.append({"epoch": float(epoch), "train_loss": float(loss.item()), "train_accuracy": acc})
+            if acc > best_acc:
+                best_acc = acc
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is None:
+        return None
+
+    model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        final_logits = model(x_tensor).detach().cpu()
+    temperature = _fit_temperature(final_logits, torch.from_numpy(y))
+
+    return {
+        "checkpoint_format": "poseai_tabular_v1",
+        "model_name": "pose_tabular_mlp",
+        "input_size": int(x.shape[1]),
+        "hidden": 128,
+        "temperature": temperature,
+        "best_accuracy": best_acc,
+        "reliability": _accuracy_to_reliability(best_acc),
+        "feature_mean": mean.astype(np.float32),
+        "feature_std": std.astype(np.float32),
+        "history": history,
+        "trained_samples": int(len(vectors)),
         "model_state": best_state,
     }
 
@@ -1326,10 +1487,12 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
 
     best_metric = float(np.mean([float(member["best_accuracy"]) for member in members]))
     reliability = float(np.mean([float(member["reliability"]) for member in members]))
+    tabular_checkpoint = _train_pose_tabular_model(entries, n_frames=cfg.pose_frames)
 
     checkpoint = {
-        "checkpoint_format": "poseai_gru_v3",
-        "model_name": "pose_gru_ensemble",
+        "checkpoint_format": "poseai_gru_v4",
+        "model_name": "pose_hybrid_ensemble",
+        "model_family": "pose_hybrid_v1",
         "class_names": CLASS_NAMES,
         "class_to_idx": CLASS_TO_IDX,
         "n_frames": cfg.pose_frames,
@@ -1354,6 +1517,10 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
 
     meta = {k: v for k, v in checkpoint.items() if k != "members"}
     POSE_GRU_META_PATH.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+    if tabular_checkpoint is not None:
+        torch.save(tabular_checkpoint, POSE_TABULAR_PATH)
+        tabular_meta = {k: v for k, v in tabular_checkpoint.items() if k not in {"model_state", "feature_mean", "feature_std"}}
+        POSE_TABULAR_META_PATH.write_text(json.dumps(tabular_meta, indent=2, default=str), encoding="utf-8")
     return POSE_GRU_PATH, best_metric
 
 
