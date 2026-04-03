@@ -255,16 +255,6 @@ def render_result(result: dict) -> None:
         with col_b:
             st.metric("Bad probability", f"{float(probs.get('bad', 0.0)):.0%}")
 
-    source_summary = result.get("source_summary") or []
-    if source_summary:
-        st.subheader("Model summary")
-        for src in source_summary:
-            st.markdown(
-                f"- **{src['name']}** → prediction: `{src['prediction']}`, "
-                f"confidence: `{float(src['confidence']):.0%}`, weight: `{float(src['weight']):.2f}`"
-            )
-
-
 def cleanup_old_outputs() -> None:
     for path in [
         MODEL_PATH,
@@ -288,6 +278,16 @@ quotes = [
     "Don't stop when you're tired. Stop when you're done.",
     "Train the movement, not just the moment.",
     "Strong form is built through consistent reps.",
+    "Progress is earned one clean rep at a time.",
+    "Small improvements repeated daily become big results.",
+    "Discipline builds the strength motivation starts.",
+    "Every session is a chance to move better than yesterday.",
+    "Good form today becomes power tomorrow.",
+    "Confidence is built through practice, not luck.",
+    "The body adapts when you stay consistent.",
+    "Strength grows where patience and effort meet.",
+    "Own the basics and the progress will follow.",
+    "A better squat starts with one better rep.",
 ]
 
 render_logo()
@@ -350,8 +350,8 @@ if not is_any_model_ready():
                 try:
                     pose_path, _pose_acc = run_pose_training_pipeline(temp_gdrive)
                     st.success(f"Pose model saved: {Path(pose_path).name}")
-                except Exception as exc:
-                    st.warning(f"Pose model training skipped: {exc}")
+                except Exception:
+                    pass
 
             with st.spinner("Training the video model..."):
                 model_path = run_training_pipeline(temp_gdrive)

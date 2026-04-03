@@ -41,7 +41,7 @@ from main import (
     is_pose_model_ready,
     llm_feedback_for_row,
     load_video_clip,
-    select_clip_starts_for_video,
+    select_motion_focused_clip_starts,
     summarize_video_entries,
 )
 
@@ -249,6 +249,7 @@ class SquatAnalyzer:
         self.clip_len = 24
         self.clip_stride = 2
         self.image_size = 112
+        self._current_video_path = ""
 
         self.pose_gru: Optional[Any] = None
         self.pose_gru_meta: Optional[Dict[str, Any]] = None
@@ -352,7 +353,14 @@ class SquatAnalyzer:
                 self.checkpoint = None
 
     def _select_clip_starts(self, total_frames: int) -> List[int]:
-        return select_clip_starts_for_video(total_frames, self.clip_len, self.clip_stride, max_clips=6)
+        return select_motion_focused_clip_starts(
+            video_path=self._current_video_path,
+            total_frames=total_frames,
+            clip_len=self.clip_len,
+            stride=self.clip_stride,
+            max_clips=6,
+            scan_frames=24,
+        )
 
     def _pose_probs(self, video_path: str | Path) -> Optional[Dict[str, Any]]:
         if self.pose_gru is None:
@@ -419,6 +427,7 @@ class SquatAnalyzer:
         if self.model is None:
             return None
 
+        self._current_video_path = str(video_path)
         total_frames = get_video_frame_count(video_path)
         clip_starts = self._select_clip_starts(total_frames)
         if not clip_starts:

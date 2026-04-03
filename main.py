@@ -114,6 +114,10 @@ class CFG:
     train_clips_per_video: int = _env_int("TRAIN_CLIPS_PER_VIDEO", 16)
     val_clips_per_video: int = _env_int("VAL_CLIPS_PER_VIDEO", 4)
     max_eval_clips: int = _env_int("MAX_EVAL_CLIPS", 6)
+    quality_scan_frames: int = _env_int("QUALITY_SCAN_FRAMES", 24)
+    min_video_frames: int = _env_int("MIN_VIDEO_FRAMES", 24)
+    min_motion_score: float = _env_float("MIN_MOTION_SCORE", 0.012)
+    min_pose_motion_score: float = _env_float("MIN_POSE_MOTION_SCORE", 0.015)
 
     use_pretrained_backbone: bool = _env_bool("USE_PRETRAINED_BACKBONE", True)
 
@@ -220,6 +224,98 @@ def get_video_frame_count(video_path: str | Path) -> int:
     finally:
         cap.release()
     return max(total, 0)
+
+
+def estimate_video_motion_score(video_path: str | Path, max_samples: int = 24) -> float:
+    cap = cv2.VideoCapture(str(video_path))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    wanted = set(_uniform_indices_for_scan(total_frames, max_samples)) if total_frames > 0 else None
+
+    prev_gray: Optional[np.ndarray] = None
+    diffs: List[float] = []
+    frame_idx = 0
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            break
+        if wanted is not None and frame_idx not in wanted:
+            frame_idx += 1
+            continue
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+        if prev_gray is not None:
+            diffs.append(float(np.mean(np.abs(gray.astype(np.float32) - prev_gray.astype(np.float32))) / 255.0))
+        prev_gray = gray
+        frame_idx += 1
+    cap.release()
+    if not diffs:
+        return 0.0
+    return float(np.mean(diffs))
+
+
+def _uniform_indices_for_scan(total_frames: int, max_samples: int) -> List[int]:
+    if total_frames <= 0:
+        return []
+    if total_frames <= max_samples:
+        return list(range(total_frames))
+    positions = np.linspace(0, total_frames - 1, num=max_samples)
+    return [int(round(float(pos))) for pos in positions]
+
+
+def select_motion_focused_clip_starts(
+    video_path: str | Path,
+    total_frames: int,
+    clip_len: int,
+    stride: int,
+    max_clips: int,
+    scan_frames: int,
+) -> List[int]:
+    uniform_starts = select_clip_starts_for_video(total_frames, clip_len, stride, max_clips)
+    if total_frames <= 0 or len(uniform_starts) <= 1:
+        return uniform_starts
+
+    clip_span = 1 + (clip_len - 1) * stride
+    max_start = max(0, total_frames - clip_span)
+    scan_positions = _uniform_indices_for_scan(total_frames, max(scan_frames, max_clips + 2))
+
+    cap = cv2.VideoCapture(str(video_path))
+    frames_by_idx: Dict[int, np.ndarray] = {}
+    wanted = set(scan_positions)
+    frame_idx = 0
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            break
+        if frame_idx in wanted:
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            frames_by_idx[frame_idx] = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+            if len(frames_by_idx) == len(wanted):
+                break
+        frame_idx += 1
+    cap.release()
+
+    available_positions = [idx for idx in scan_positions if idx in frames_by_idx]
+    if len(available_positions) < 3:
+        return uniform_starts
+
+    motion_scores: List[Tuple[float, int]] = []
+    for start in uniform_starts:
+        end = min(total_frames - 1, start + clip_span - 1)
+        inside = [idx for idx in available_positions if start <= idx <= end]
+        if len(inside) < 2:
+            motion_scores.append((0.0, start))
+            continue
+        diffs = []
+        prev = frames_by_idx[inside[0]]
+        for idx in inside[1:]:
+            cur = frames_by_idx[idx]
+            diffs.append(float(np.mean(np.abs(cur.astype(np.float32) - prev.astype(np.float32))) / 255.0))
+            prev = cur
+        motion_scores.append((float(np.mean(diffs)) if diffs else 0.0, start))
+
+    motion_scores.sort(key=lambda item: item[0], reverse=True)
+    ranked = [start for _, start in motion_scores[:max_clips]]
+    return sorted(set(ranked)) or uniform_starts
 
 
 def select_clip_starts_for_video(
@@ -537,6 +633,41 @@ def summarize_pose_feature_sequence(feature_seq: np.ndarray) -> np.ndarray:
     return np.concatenate([mean, std, min_v, max_v], axis=0).astype(np.float32)
 
 
+def pose_motion_score_from_sequence(coords_seq: Optional[np.ndarray]) -> float:
+    if coords_seq is None or len(coords_seq) < 2:
+        return 0.0
+    deltas = np.diff(coords_seq.astype(np.float32), axis=0)
+    return float(np.mean(np.linalg.norm(deltas, axis=1)))
+
+
+def filter_entries_for_pose_training(entries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    for item in entries:
+        seq = _extract_pose_seq(item["path"], n_frames=cfg.pose_frames)
+        if seq is None:
+            continue
+        if pose_motion_score_from_sequence(seq) < cfg.min_pose_motion_score:
+            continue
+        filtered.append(dict(item))
+    return filtered
+
+
+def filter_entries_for_video_training(entries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    for item in entries:
+        frame_count = get_video_frame_count(item["path"])
+        if frame_count < cfg.min_video_frames:
+            continue
+        motion_score = estimate_video_motion_score(item["path"], max_samples=cfg.quality_scan_frames)
+        if motion_score < cfg.min_motion_score:
+            continue
+        enriched = dict(item)
+        enriched["frame_count"] = frame_count
+        enriched["motion_score"] = motion_score
+        filtered.append(enriched)
+    return filtered
+
+
 def _make_loader(
     dataset: Dataset,
     labels: Sequence[int],
@@ -644,7 +775,14 @@ def _predict_video_logits(
     max_eval_clips: int,
 ) -> Tuple[Optional[torch.Tensor], List[Dict[str, Any]], float, int]:
     total_frames = get_video_frame_count(video_path)
-    clip_starts = select_clip_starts_for_video(total_frames, clip_len, stride, max_eval_clips)
+    clip_starts = select_motion_focused_clip_starts(
+        video_path,
+        total_frames,
+        clip_len,
+        stride,
+        max_eval_clips,
+        cfg.quality_scan_frames,
+    )
     if not clip_starts:
         return None, [], 0.0, total_frames
 
@@ -1452,15 +1590,15 @@ def _train_pose_tabular_model(
 
 def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[Path, float]:
     data_root = Path(data_root) if data_root is not None else ROOT / "temp_gdrive"
-    entries = collect_labeled_videos(data_root)
+    entries = filter_entries_for_pose_training(collect_labeled_videos(data_root))
     counts = summarize_video_entries(entries)
 
     if counts["good"] == 0:
-        raise RuntimeError("No GOOD videos found.")
+        raise RuntimeError("No GOOD pose videos with usable landmarks were found.")
     if counts["bad"] == 0:
-        raise RuntimeError("No BAD videos found.")
+        raise RuntimeError("No BAD pose videos with usable landmarks were found.")
     if counts["total"] < 2:
-        raise RuntimeError("Need at least 2 videos.")
+        raise RuntimeError("Need at least 2 usable videos for pose training.")
 
     members: List[Dict[str, Any]] = []
     all_histories: List[Dict[str, Any]] = []
@@ -1526,15 +1664,15 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
 
 def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
     data_root = Path(data_root) if data_root is not None else ROOT / "temp_gdrive"
-    entries = collect_labeled_videos(data_root)
+    entries = filter_entries_for_video_training(collect_labeled_videos(data_root))
     counts = summarize_video_entries(entries)
 
     if counts["good"] == 0:
-        raise RuntimeError("No GOOD videos were found. Place videos under a folder named 'good'.")
+        raise RuntimeError("No GOOD videos passed the video quality checks. Add clearer motion clips and try again.")
     if counts["bad"] == 0:
-        raise RuntimeError("No BAD videos were found. Place videos under a folder named 'bad'.")
+        raise RuntimeError("No BAD videos passed the video quality checks. Add clearer motion clips and try again.")
     if counts["total"] < 2:
-        raise RuntimeError("At least 2 videos are required to train a video model.")
+        raise RuntimeError("At least 2 usable videos are required to train a video model.")
 
     train_entries, val_entries = _split_entries(entries, cfg.val_ratio, cfg.seed)
     if not train_entries:
