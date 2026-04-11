@@ -105,28 +105,31 @@ class CFG:
     batch_size: int = _env_int("BATCH_SIZE", 4)
     num_workers: int = _env_int("NUM_WORKERS", 0)
 
-    epochs: int = _env_int("EPOCHS", 25)
+    epochs: int = _env_int("EPOCHS", 10)
     learning_rate: float = _env_float("LEARNING_RATE", 3e-4)
     weight_decay: float = _env_float("WEIGHT_DECAY", 1e-4)
     label_smoothing: float = _env_float("LABEL_SMOOTHING", 0.05)
-    early_stop_patience: int = _env_int("EARLY_STOP_PATIENCE", 6)
+    early_stop_patience: int = _env_int("EARLY_STOP_PATIENCE", 3)
 
-    train_clips_per_video: int = _env_int("TRAIN_CLIPS_PER_VIDEO", 16)
+    train_clips_per_video: int = _env_int("TRAIN_CLIPS_PER_VIDEO", 6)
     val_clips_per_video: int = _env_int("VAL_CLIPS_PER_VIDEO", 4)
-    max_eval_clips: int = _env_int("MAX_EVAL_CLIPS", 6)
-    quality_scan_frames: int = _env_int("QUALITY_SCAN_FRAMES", 24)
+    max_eval_clips: int = _env_int("MAX_EVAL_CLIPS", 4)
+    quality_scan_frames: int = _env_int("QUALITY_SCAN_FRAMES", 12)
     min_video_frames: int = _env_int("MIN_VIDEO_FRAMES", 24)
     min_motion_score: float = _env_float("MIN_MOTION_SCORE", 0.012)
     min_pose_motion_score: float = _env_float("MIN_POSE_MOTION_SCORE", 0.015)
 
     use_pretrained_backbone: bool = _env_bool("USE_PRETRAINED_BACKBONE", True)
+    video_finetune_mode: str = os.environ.get("VIDEO_FINETUNE_MODE", "fc").strip().lower() or "fc"
+    video_use_tta: bool = _env_bool("VIDEO_USE_TTA", False)
 
     pose_frames: int = _env_int("POSE_FRAMES", 32)
     pose_hidden_size: int = _env_int("POSE_HIDDEN_SIZE", 64)
     pose_layers: int = _env_int("POSE_LAYERS", 2)
     pose_dropout: float = _env_float("POSE_DROPOUT", 0.35)
     pose_learning_rate: float = _env_float("POSE_LEARNING_RATE", 1e-3)
-    pose_ensemble_members: int = _env_int("POSE_ENSEMBLE_MEMBERS", 5)
+    pose_ensemble_members: int = _env_int("POSE_ENSEMBLE_MEMBERS", 3)
+    video_ensemble_members: int = _env_int("VIDEO_ENSEMBLE_MEMBERS", 1)
 
 
 cfg = CFG()
@@ -253,6 +256,41 @@ def estimate_video_motion_score(video_path: str | Path, max_samples: int = 24) -
     return float(np.mean(diffs))
 
 
+def estimate_canny_edge_score(video_path: str | Path, max_samples: int = 24) -> Dict[str, float]:
+    cap = cv2.VideoCapture(str(video_path))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    wanted = set(_uniform_indices_for_scan(total_frames, max_samples)) if total_frames > 0 else None
+
+    prev_edges: Optional[np.ndarray] = None
+    edge_density_values: List[float] = []
+    edge_change_values: List[float] = []
+    frame_idx = 0
+
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            break
+        if wanted is not None and frame_idx not in wanted:
+            frame_idx += 1
+            continue
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 50, 150)
+        edge_density_values.append(float(np.mean(edges > 0)))
+        if prev_edges is not None:
+            edge_change_values.append(float(np.mean(edges != prev_edges)))
+        prev_edges = edges
+        frame_idx += 1
+
+    cap.release()
+    return {
+        "edge_density": float(np.mean(edge_density_values)) if edge_density_values else 0.0,
+        "edge_change": float(np.mean(edge_change_values)) if edge_change_values else 0.0,
+    }
+
+
 def _uniform_indices_for_scan(total_frames: int, max_samples: int) -> List[int]:
     if total_frames <= 0:
         return []
@@ -306,12 +344,19 @@ def select_motion_focused_clip_starts(
             motion_scores.append((0.0, start))
             continue
         diffs = []
+        edge_diffs = []
         prev = frames_by_idx[inside[0]]
+        prev_edges = cv2.Canny(cv2.GaussianBlur(prev, (5, 5), 0), 50, 150)
         for idx in inside[1:]:
             cur = frames_by_idx[idx]
             diffs.append(float(np.mean(np.abs(cur.astype(np.float32) - prev.astype(np.float32))) / 255.0))
+            cur_edges = cv2.Canny(cv2.GaussianBlur(cur, (5, 5), 0), 50, 150)
+            edge_diffs.append(float(np.mean(cur_edges != prev_edges)))
             prev = cur
-        motion_scores.append((float(np.mean(diffs)) if diffs else 0.0, start))
+            prev_edges = cur_edges
+        pixel_motion = float(np.mean(diffs)) if diffs else 0.0
+        edge_motion = float(np.mean(edge_diffs)) if edge_diffs else 0.0
+        motion_scores.append((((0.65 * pixel_motion) + (0.35 * edge_motion)), start))
 
     motion_scores.sort(key=lambda item: item[0], reverse=True)
     ranked = [start for _, start in motion_scores[:max_clips]]
@@ -380,19 +425,24 @@ def load_video_clip(
 ) -> torch.Tensor:
     """Load a whole-video clip tensor in C x T x H x W format."""
     video_path = str(video_path)
+    
+    def _read_all_frames(path: str) -> List[np.ndarray]:
+        cap_local = cv2.VideoCapture(path)
+        frames_local: List[np.ndarray] = []
+        while True:
+            ok_local, frame_bgr_local = cap_local.read()
+            if not ok_local:
+                break
+            frames_local.append(cv2.cvtColor(frame_bgr_local, cv2.COLOR_BGR2RGB))
+        cap_local.release()
+        return frames_local
+
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     if total_frames <= 0:
         cap.release()
-        cap = cv2.VideoCapture(video_path)
-        fallback_frames: List[np.ndarray] = []
-        while True:
-            ok, frame_bgr = cap.read()
-            if not ok:
-                break
-            fallback_frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        cap.release()
+        fallback_frames = _read_all_frames(video_path)
         if not fallback_frames:
             raise RuntimeError(f"Could not decode video: {video_path}")
         indices = _sample_indices(
@@ -427,14 +477,24 @@ def load_video_clip(
         cap.release()
 
         if not frames_by_idx:
-            raise RuntimeError(f"Could not sample frames from video: {video_path}")
-
-        last_frame = frames_by_idx[min(frames_by_idx.keys())]
-        frames = []
-        for idx in indices:
-            if idx in frames_by_idx:
-                last_frame = frames_by_idx[idx]
-            frames.append(last_frame)
+            fallback_frames = _read_all_frames(video_path)
+            if not fallback_frames:
+                raise RuntimeError(f"Could not sample frames from video: {video_path}")
+            indices = _sample_indices(
+                len(fallback_frames),
+                clip_len,
+                stride,
+                center=center,
+                start_idx=start_idx,
+            )
+            frames = [_resize_rgb(fallback_frames[idx], image_size) for idx in indices]
+        else:
+            last_frame = frames_by_idx[min(frames_by_idx.keys())]
+            frames = []
+            for idx in indices:
+                if idx in frames_by_idx:
+                    last_frame = frames_by_idx[idx]
+                frames.append(last_frame)
 
     clip = np.stack(frames, axis=0).astype(np.float32) / 255.0  # T,H,W,C
     clip = (clip - _VIDEO_MEAN) / _VIDEO_STD
@@ -462,6 +522,7 @@ class VideoClipDataset(Dataset):
         self.image_size = image_size
         self.train = train
         self.clips_per_video = max(1, clips_per_video)
+        self._start_cache: Dict[int, List[int]] = {}
 
     def __len__(self) -> int:
         return len(self.entries) * self.clips_per_video
@@ -469,13 +530,27 @@ class VideoClipDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
         video_index = index % len(self.entries)
         item = self.entries[video_index]
+        start_idx: Optional[int] = None
+        if self.train:
+            if video_index not in self._start_cache:
+                total_frames = get_video_frame_count(item["path"])
+                self._start_cache[video_index] = select_motion_focused_clip_starts(
+                    item["path"],
+                    total_frames,
+                    self.clip_len,
+                    self.stride,
+                    max_clips=min(4, max(1, self.clips_per_video)),
+                    scan_frames=cfg.quality_scan_frames,
+                )
+            starts = self._start_cache.get(video_index) or [0]
+            start_idx = random.choice(starts)
         clip = load_video_clip(
             item["path"],
             clip_len=self.clip_len,
             stride=self.stride,
             image_size=self.image_size,
             center=not self.train,
-            start_idx=None,
+            start_idx=start_idx,
         )
         if self.train and random.random() < 0.5:
             clip = torch.flip(clip, dims=[3])  # horizontal flip
@@ -529,6 +604,7 @@ def build_model(
     pretrained: bool = False,
     device: str = DEVICE,
     freeze_backbone: bool = False,
+    finetune_mode: str = "last_block",
 ) -> nn.Module:
     if r3d_18 is not None:
         weights = None
@@ -537,8 +613,12 @@ def build_model(
         model = r3d_18(weights=weights)
         model.fc = nn.Linear(model.fc.in_features, len(CLASS_NAMES))
         if freeze_backbone:
+            finetune_mode = (finetune_mode or "fc").lower()
             for name, param in model.named_parameters():
-                param.requires_grad = name.startswith("fc.")
+                allow = name.startswith("fc.")
+                if finetune_mode == "last_block" and name.startswith("layer4."):
+                    allow = True
+                param.requires_grad = allow
     else:
         model = VideoClassifier3D(num_classes=len(CLASS_NAMES))
     model.to(device)
@@ -659,13 +739,135 @@ def filter_entries_for_video_training(entries: Sequence[Dict[str, Any]]) -> List
         if frame_count < cfg.min_video_frames:
             continue
         motion_score = estimate_video_motion_score(item["path"], max_samples=cfg.quality_scan_frames)
-        if motion_score < cfg.min_motion_score:
+        edge_scores = estimate_canny_edge_score(item["path"], max_samples=cfg.quality_scan_frames)
+        combined_motion = motion_score
+        if combined_motion < cfg.min_motion_score:
             continue
         enriched = dict(item)
         enriched["frame_count"] = frame_count
         enriched["motion_score"] = motion_score
+        enriched["edge_density"] = float(edge_scores["edge_density"])
+        enriched["edge_change"] = float(edge_scores["edge_change"])
+        enriched["combined_motion_score"] = combined_motion
         filtered.append(enriched)
     return filtered
+
+
+def _build_suspicious_video_report(
+    entries: Sequence[Dict[str, Any]],
+    *,
+    val_reports: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    val_by_path = {
+        str(item.get("path")): dict(item)
+        for item in (val_reports or [])
+        if item.get("path")
+    }
+
+    suspicious_items: List[Dict[str, Any]] = []
+    flagged_by_reason: Dict[str, int] = {}
+    checked_videos = 0
+
+    for item in entries:
+        path = str(item["path"])
+        relative_path = str(item.get("relative_path") or Path(path).name)
+        label = str(item["label"]).lower()
+        frame_count = get_video_frame_count(path)
+        motion_score = estimate_video_motion_score(path, max_samples=cfg.quality_scan_frames)
+        edge_scores = estimate_canny_edge_score(path, max_samples=cfg.quality_scan_frames)
+        pose_seq = _extract_pose_seq(path, n_frames=cfg.pose_frames)
+        pose_motion = pose_motion_score_from_sequence(pose_seq) if pose_seq is not None else 0.0
+        checked_videos += 1
+
+        reasons: List[str] = []
+        suspicion_score = 0.0
+
+        if frame_count < max(cfg.min_video_frames, cfg.clip_len):
+            reasons.append(f"Very short video ({frame_count} frames)")
+            suspicion_score += 1.35
+        elif frame_count < int(cfg.min_video_frames * 1.5):
+            reasons.append(f"Short video ({frame_count} frames)")
+            suspicion_score += 0.75
+
+        if motion_score < cfg.min_motion_score * 0.8:
+            reasons.append(f"Very low motion ({motion_score:.3f})")
+            suspicion_score += 1.25
+        elif motion_score < cfg.min_motion_score * 1.2:
+            reasons.append(f"Low motion ({motion_score:.3f})")
+            suspicion_score += 0.65
+
+        if edge_scores["edge_density"] < 0.015:
+            reasons.append(f"Low visual detail ({edge_scores['edge_density']:.3f})")
+            suspicion_score += 0.45
+
+        if pose_seq is None:
+            reasons.append("Pose landmarks were not detected well")
+            suspicion_score += 1.25
+        elif pose_motion < cfg.min_pose_motion_score * 0.8:
+            reasons.append(f"Pose sequence is almost static ({pose_motion:.3f})")
+            suspicion_score += 1.0
+        elif pose_motion < cfg.min_pose_motion_score * 1.2:
+            reasons.append(f"Weak pose motion ({pose_motion:.3f})")
+            suspicion_score += 0.5
+
+        val_report = val_by_path.get(path)
+        if val_report:
+            predicted_label = str(val_report.get("predicted_label", "")).lower()
+            confidence = float(val_report.get("confidence", 0.0))
+            margin = float(val_report.get("margin", 0.0))
+            agreement = float(val_report.get("agreement", 0.0))
+            if predicted_label and predicted_label != label and confidence >= 0.6:
+                reasons.append(
+                    f"Validation mismatch: labeled {label}, predicted {predicted_label} ({confidence:.0%})"
+                )
+                suspicion_score += 1.5
+            elif confidence < 0.6 or margin < 0.15 or agreement < 0.55:
+                reasons.append(
+                    f"Borderline validation result ({confidence:.0%} confidence, {agreement:.0%} agreement)"
+                )
+                suspicion_score += 0.85
+
+        if not reasons:
+            continue
+
+        for reason in reasons:
+            flagged_by_reason[reason] = flagged_by_reason.get(reason, 0) + 1
+
+        suspicious_items.append(
+            {
+                "path": path,
+                "relative_path": relative_path,
+                "label": label,
+                "frame_count": int(frame_count),
+                "motion_score": float(motion_score),
+                "pose_motion_score": float(pose_motion),
+                "edge_density": float(edge_scores["edge_density"]),
+                "edge_change": float(edge_scores["edge_change"]),
+                "reasons": reasons,
+                "suspicion_score": round(float(suspicion_score), 3),
+                "validation": val_report or None,
+            }
+        )
+
+    suspicious_items.sort(
+        key=lambda item: (
+            -float(item["suspicion_score"]),
+            str(item["label"]),
+            str(item["relative_path"]).lower(),
+        )
+    )
+
+    top_reasons = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(flagged_by_reason.items(), key=lambda item: (-item[1], item[0]))[:8]
+    ]
+
+    return {
+        "checked_videos": int(checked_videos),
+        "flagged_videos": int(len(suspicious_items)),
+        "top_reasons": top_reasons,
+        "videos": suspicious_items[:12],
+    }
 
 
 def _make_loader(
@@ -690,12 +892,22 @@ def _make_loader(
     return DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=num_workers)
 
 
-def _set_video_backbone_mode(model: nn.Module, backbone_trainable: bool) -> None:
+def _set_video_backbone_mode(model: nn.Module, backbone_trainable: bool, finetune_mode: str = "last_block") -> None:
     if backbone_trainable or not hasattr(model, "fc"):
         return
-    for name, module in model.named_children():
-        if name != "fc":
-            module.eval()
+    model.eval()
+    finetune_mode = (finetune_mode or "fc").lower()
+    if finetune_mode == "last_block" and hasattr(model, "layer4"):
+        model.layer4.train()
+    model.fc.train()
+
+
+def _tta_logits(model: nn.Module, clip: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    views = [clip]
+    if cfg.video_use_tta:
+        views.append(torch.flip(clip, dims=[4]))
+    logits_list = [model(view) for view in views]
+    return torch.mean(torch.stack(logits_list, dim=0), dim=0)
 
 
 @torch.no_grad()
@@ -799,7 +1011,7 @@ def _predict_video_logits(
             center=False,
             start_idx=start,
         ).unsqueeze(0).to(device)
-        logits = model(clip).detach().cpu()
+        logits = _tta_logits(model, clip).detach().cpu()
         probs = torch.softmax(logits, dim=-1)[0]
         pred_idx = int(torch.argmax(probs).item())
         clip_votes.append(pred_idx)
@@ -847,10 +1059,11 @@ def _evaluate_video_entries(
     labels_list: List[int] = []
     predictions: List[int] = []
     total_loss = 0.0
+    prediction_records: List[Dict[str, Any]] = []
 
     model.eval()
     for item in entries:
-        logits, _, _, _ = _predict_video_logits(
+        logits, _clip_results, agreement, total_frames = _predict_video_logits(
             model,
             item["path"],
             clip_len=clip_len,
@@ -867,7 +1080,23 @@ def _evaluate_video_entries(
         total_loss += float(criterion(logits, label_tensor).item())
         logits_list.append(logits)
         labels_list.append(label)
-        predictions.append(int(torch.argmax(logits, dim=1).item()))
+        pred_idx = int(torch.argmax(logits, dim=1).item())
+        predictions.append(pred_idx)
+        probs = torch.softmax(logits, dim=-1)[0]
+        sorted_probs, _ = torch.sort(probs, descending=True)
+        margin = float((sorted_probs[0] - sorted_probs[1]).item()) if len(sorted_probs) > 1 else float(sorted_probs[0].item())
+        prediction_records.append(
+            {
+                "path": str(item["path"]),
+                "relative_path": str(item.get("relative_path") or Path(str(item["path"])).name),
+                "label": str(item["label"]).lower(),
+                "predicted_label": CLASS_NAMES[pred_idx],
+                "confidence": float(probs[pred_idx].item()),
+                "margin": margin,
+                "agreement": float(agreement),
+                "total_frames": int(total_frames),
+            }
+        )
 
     if not logits_list:
         return {
@@ -876,6 +1105,7 @@ def _evaluate_video_entries(
             "logits": None,
             "labels": None,
             "predictions": [],
+            "prediction_records": [],
         }
 
     labels_tensor = torch.tensor(labels_list, dtype=torch.long)
@@ -886,6 +1116,7 @@ def _evaluate_video_entries(
         "logits": torch.cat(logits_list, dim=0),
         "labels": labels_tensor,
         "predictions": predictions,
+        "prediction_records": prediction_records,
     }
 
 
@@ -1017,7 +1248,7 @@ def is_model_ready(model_path: Path | str = MODEL_PATH) -> bool:
         meta = json.loads(MODEL_META_PATH.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return meta.get("checkpoint_format") in {"poseai_video_v1", "poseai_video_v2"}
+    return meta.get("checkpoint_format") in {"poseai_video_v1", "poseai_video_v2", "poseai_video_v3"}
 
 
 def is_pose_model_ready(model_path: Path | str = POSE_GRU_PATH) -> bool:
@@ -1508,74 +1739,100 @@ def _extract_pose_tabular_vector(video_path: str | Path, n_frames: int) -> Optio
     if seq is None:
         return None
     feature_seq = build_pose_feature_sequence(seq)
-    return summarize_pose_feature_sequence(feature_seq)
+    summary = summarize_pose_feature_sequence(feature_seq)
+    motion_score = estimate_video_motion_score(video_path, max_samples=min(12, n_frames))
+    edge_scores = estimate_canny_edge_score(video_path, max_samples=min(12, n_frames))
+    extra = np.array([motion_score, float(edge_scores["edge_density"]), float(edge_scores["edge_change"])], dtype=np.float32)
+    return np.concatenate([summary, extra], axis=0).astype(np.float32)
 
 
 def _train_pose_tabular_model(
-    entries: Sequence[Dict[str, Any]],
+    train_entries: Sequence[Dict[str, Any]],
+    val_entries: Sequence[Dict[str, Any]],
     *,
     n_frames: int,
 ) -> Optional[Dict[str, Any]]:
-    vectors: List[np.ndarray] = []
-    labels: List[int] = []
-    for item in entries:
-        vec = _extract_pose_tabular_vector(item["path"], n_frames=n_frames)
-        if vec is None:
-            continue
-        vectors.append(vec)
-        labels.append(CLASS_TO_IDX[str(item["label"]).lower()])
+    def collect_vectors(source_entries: Sequence[Dict[str, Any]]) -> Tuple[List[np.ndarray], List[int]]:
+        vectors: List[np.ndarray] = []
+        labels: List[int] = []
+        for item in source_entries:
+            vec = _extract_pose_tabular_vector(item["path"], n_frames=n_frames)
+            if vec is None:
+                continue
+            vectors.append(vec)
+            labels.append(CLASS_TO_IDX[str(item["label"]).lower()])
+        return vectors, labels
 
-    if len(vectors) < 4 or len(set(labels)) < 2:
+    train_vectors, train_labels = collect_vectors(train_entries)
+    val_vectors, val_labels = collect_vectors(val_entries)
+
+    if len(train_vectors) < 4 or len(set(train_labels)) < 2:
+        return None
+    if len(val_vectors) < 2 or len(set(val_labels)) < 2:
         return None
 
-    x = np.stack(vectors).astype(np.float32)
-    y = np.array(labels, dtype=np.int64)
-    mean = x.mean(axis=0, keepdims=True)
-    std = x.std(axis=0, keepdims=True) + 1e-6
-    x = (x - mean) / std
+    x_train = np.stack(train_vectors).astype(np.float32)
+    y_train = np.array(train_labels, dtype=np.int64)
+    x_val = np.stack(val_vectors).astype(np.float32)
+    y_val = np.array(val_labels, dtype=np.int64)
 
-    x_tensor = torch.from_numpy(x).to(DEVICE)
-    y_tensor = torch.from_numpy(y).to(DEVICE)
+    mean = x_train.mean(axis=0, keepdims=True)
+    std = x_train.std(axis=0, keepdims=True) + 1e-6
+    x_train = (x_train - mean) / std
+    x_val = (x_val - mean) / std
 
-    model = PoseTabularClassifier(input_size=x.shape[1], hidden=128, num_classes=len(CLASS_NAMES), dropout=0.2).to(DEVICE)
+    x_train_tensor = torch.from_numpy(x_train).to(DEVICE)
+    y_train_tensor = torch.from_numpy(y_train).to(DEVICE)
+    x_val_tensor = torch.from_numpy(x_val).to(DEVICE)
+    y_val_tensor = torch.from_numpy(y_val).to(DEVICE)
+
+    model = PoseTabularClassifier(input_size=x_train.shape[1], hidden=128, num_classes=len(CLASS_NAMES), dropout=0.2).to(DEVICE)
     criterion = nn.CrossEntropyLoss(label_smoothing=max(0.0, cfg.label_smoothing * 0.5))
     optimizer = torch.optim.AdamW(model.parameters(), lr=8e-4, weight_decay=1e-4)
 
     best_state: Optional[Dict[str, torch.Tensor]] = None
     best_acc = -float("inf")
+    best_val_logits: Optional[torch.Tensor] = None
     history: List[Dict[str, float]] = []
 
     for epoch in range(1, min(cfg.epochs, 20) + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x_tensor)
-        loss = criterion(logits, y_tensor)
+        train_logits = model(x_train_tensor)
+        loss = criterion(train_logits, y_train_tensor)
         loss.backward()
         optimizer.step()
 
         with torch.no_grad():
             model.eval()
-            eval_logits = model(x_tensor)
-            preds = torch.argmax(eval_logits, dim=1)
-            acc = float((preds == y_tensor).float().mean().item())
-            history.append({"epoch": float(epoch), "train_loss": float(loss.item()), "train_accuracy": acc})
-            if acc > best_acc:
-                best_acc = acc
+            eval_train_logits = model(x_train_tensor)
+            eval_val_logits = model(x_val_tensor)
+            train_preds = torch.argmax(eval_train_logits, dim=1)
+            val_preds = torch.argmax(eval_val_logits, dim=1)
+            train_acc = float((train_preds == y_train_tensor).float().mean().item())
+            val_acc = float((val_preds == y_val_tensor).float().mean().item())
+            history.append(
+                {
+                    "epoch": float(epoch),
+                    "train_loss": float(loss.item()),
+                    "train_accuracy": train_acc,
+                    "val_accuracy": val_acc,
+                }
+            )
+            if val_acc > best_acc:
+                best_acc = val_acc
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_val_logits = eval_val_logits.detach().cpu().clone()
 
-    if best_state is None:
+    if best_state is None or best_val_logits is None:
         return None
 
-    model.load_state_dict(best_state)
-    model.eval()
-    with torch.no_grad():
-        final_logits = model(x_tensor).detach().cpu()
-    temperature = _fit_temperature(final_logits, torch.from_numpy(y))
+    temperature = _fit_temperature(best_val_logits, torch.from_numpy(y_val))
 
     return {
-        "checkpoint_format": "poseai_tabular_v1",
+        "checkpoint_format": "poseai_tabular_v2",
         "model_name": "pose_tabular_mlp",
-        "input_size": int(x.shape[1]),
+        "input_size": int(x_train.shape[1]),
         "hidden": 128,
         "temperature": temperature,
         "best_accuracy": best_acc,
@@ -1583,7 +1840,8 @@ def _train_pose_tabular_model(
         "feature_mean": mean.astype(np.float32),
         "feature_std": std.astype(np.float32),
         "history": history,
-        "trained_samples": int(len(vectors)),
+        "trained_samples": int(len(train_vectors)),
+        "val_samples": int(len(val_vectors)),
         "model_state": best_state,
     }
 
@@ -1603,12 +1861,17 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
     members: List[Dict[str, Any]] = []
     all_histories: List[Dict[str, Any]] = []
     ensemble_members = max(1, min(cfg.pose_ensemble_members, 5))
+    first_train_entries: List[Dict[str, Any]] = []
+    first_val_entries: List[Dict[str, Any]] = []
 
     for member_idx in range(ensemble_members):
         split_seed = cfg.seed + (member_idx * 17)
         train_entries, val_entries = _split_entries(entries, cfg.val_ratio, split_seed)
         if not train_entries:
             continue
+        if not first_train_entries:
+            first_train_entries = list(train_entries)
+            first_val_entries = list(val_entries)
         member = _train_single_pose_model(train_entries, val_entries, split_seed=split_seed)
         members.append(member)
         all_histories.append(
@@ -1625,7 +1888,7 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
 
     best_metric = float(np.mean([float(member["best_accuracy"]) for member in members]))
     reliability = float(np.mean([float(member["reliability"]) for member in members]))
-    tabular_checkpoint = _train_pose_tabular_model(entries, n_frames=cfg.pose_frames)
+    tabular_checkpoint = _train_pose_tabular_model(first_train_entries, first_val_entries, n_frames=cfg.pose_frames)
 
     checkpoint = {
         "checkpoint_format": "poseai_gru_v4",
@@ -1664,178 +1927,370 @@ def run_pose_training_pipeline(data_root: Optional[str | Path] = None) -> Tuple[
 
 def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
     data_root = Path(data_root) if data_root is not None else ROOT / "temp_gdrive"
-    entries = filter_entries_for_video_training(collect_labeled_videos(data_root))
-    counts = summarize_video_entries(entries)
+    raw_entries = collect_labeled_videos(data_root)
+    counts = summarize_video_entries(raw_entries)
 
     if counts["good"] == 0:
-        raise RuntimeError("No GOOD videos passed the video quality checks. Add clearer motion clips and try again.")
+        raise RuntimeError("No GOOD videos were found. Place videos under a folder named 'good'.")
     if counts["bad"] == 0:
-        raise RuntimeError("No BAD videos passed the video quality checks. Add clearer motion clips and try again.")
+        raise RuntimeError("No BAD videos were found. Place videos under a folder named 'bad'.")
     if counts["total"] < 2:
-        raise RuntimeError("At least 2 usable videos are required to train a video model.")
+        raise RuntimeError("At least 2 videos are required to train a video model.")
 
-    train_entries, val_entries = _split_entries(entries, cfg.val_ratio, cfg.seed)
-    if not train_entries:
-        raise RuntimeError("Training split is empty. Add more labeled videos and try again.")
+    def maybe_filter_train_entries(candidate_name: str, source_entries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if candidate_name == "quality_filtered":
+            filtered = filter_entries_for_video_training(source_entries)
+            filtered_counts = summarize_video_entries(filtered)
+            if filtered_counts["good"] > 0 and filtered_counts["bad"] > 0 and filtered_counts["total"] >= 2:
+                return filtered
+        return [dict(item) for item in source_entries]
 
-    train_labels = [CLASS_TO_IDX[item["label"]] for item in train_entries]
-    train_dataset = VideoClipDataset(
-        train_entries,
-        clip_len=cfg.clip_len,
-        stride=cfg.clip_stride,
-        image_size=cfg.image_size,
-        train=True,
-        clips_per_video=cfg.train_clips_per_video,
-    )
-    train_loader = _make_loader(train_dataset, train_labels, cfg.batch_size, cfg.num_workers, train=True)
-    freeze_backbone = bool(cfg.use_pretrained_backbone and r3d_18 is not None and counts["total"] < 60)
-    model = build_model(
-        pretrained=cfg.use_pretrained_backbone,
-        device=DEVICE,
-        freeze_backbone=freeze_backbone,
-    )
-    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
-    trainable_params = [param for param in model.parameters() if param.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=2,
-    )
+    candidate_specs: List[Dict[str, Any]] = [
+        {"name": "baseline", "clip_len": 24, "clip_stride": 2, "finetune_mode": "fc", "learning_rate": cfg.learning_rate},
+        {"name": "short_clip", "clip_len": 16, "clip_stride": 2, "finetune_mode": "fc", "learning_rate": cfg.learning_rate},
+        {"name": "dense_clip", "clip_len": 20, "clip_stride": 1, "finetune_mode": "fc", "learning_rate": max(1e-4, cfg.learning_rate * 0.75)},
+        {"name": "low_lr", "clip_len": 24, "clip_stride": 2, "finetune_mode": "fc", "learning_rate": max(1e-4, cfg.learning_rate * 0.5)},
+    ]
+    if counts["total"] >= 30:
+        candidate_specs.append({"name": "quality_filtered", "clip_len": 24, "clip_stride": 2, "finetune_mode": "fc", "learning_rate": cfg.learning_rate})
+    if counts["total"] >= 80:
+        candidate_specs.append({"name": "last_block", "clip_len": 24, "clip_stride": 2, "finetune_mode": "last_block", "learning_rate": max(1e-4, cfg.learning_rate * 0.5)})
 
-    history: List[Dict[str, float]] = []
-    best_metric = -float("inf")
-    best_state: Optional[Dict[str, torch.Tensor]] = None
-    patience = 0
+    split_seeds = [cfg.seed]
+    if counts["total"] >= 12:
+        split_seeds.append(cfg.seed + 17)
+    if counts["total"] >= 20:
+        split_seeds.append(cfg.seed + 34)
 
-    use_amp = DEVICE == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    def train_single_video_member(
+        member_seed: int,
+        candidate: Dict[str, Any],
+        *,
+        train_entries_for_split: Sequence[Dict[str, Any]],
+        val_entries_for_split: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        set_seed(member_seed)
+        candidate_train_entries = maybe_filter_train_entries(str(candidate["name"]), train_entries_for_split)
+        candidate_counts = summarize_video_entries(candidate_train_entries)
+        if candidate_counts["good"] == 0 or candidate_counts["bad"] == 0 or candidate_counts["total"] < 2:
+            raise RuntimeError(f"Candidate {candidate['name']} has insufficient usable training videos.")
 
-    for epoch in range(1, cfg.epochs + 1):
-        model.train()
-        _set_video_backbone_mode(model, backbone_trainable=not freeze_backbone)
-        running_loss = 0.0
-        running_correct = 0
-        running_samples = 0
+        train_labels = [CLASS_TO_IDX[item["label"]] for item in candidate_train_entries]
+        train_dataset = VideoClipDataset(
+            candidate_train_entries,
+            clip_len=int(candidate["clip_len"]),
+            stride=int(candidate["clip_stride"]),
+            image_size=cfg.image_size,
+            train=True,
+            clips_per_video=cfg.train_clips_per_video,
+        )
+        train_loader = _make_loader(train_dataset, train_labels, cfg.batch_size, cfg.num_workers, train=True)
+        finetune_mode = str(candidate["finetune_mode"])
+        freeze_backbone = bool(cfg.use_pretrained_backbone and r3d_18 is not None and counts["total"] < 60)
+        model = build_model(
+            pretrained=cfg.use_pretrained_backbone,
+            device=DEVICE,
+            freeze_backbone=freeze_backbone,
+            finetune_mode=finetune_mode,
+        )
+        criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+        trainable_params = [param for param in model.parameters() if param.requires_grad]
+        learning_rate = float(candidate.get("learning_rate", cfg.learning_rate))
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=cfg.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=2,
+        )
 
-        for clips, labels in train_loader:
-            clips = clips.to(DEVICE)
-            labels = labels.to(DEVICE)
+        history: List[Dict[str, float]] = []
+        best_metric = -float("inf")
+        best_state: Optional[Dict[str, torch.Tensor]] = None
+        best_epoch = 1
+        patience = 0
+        use_amp = DEVICE == "cuda"
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-            optimizer.zero_grad(set_to_none=True)
-            amp_context = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
-            with amp_context:
-                logits = model(clips)
-                loss = criterion(logits, labels)
+        for epoch in range(1, cfg.epochs + 1):
+            model.train()
+            _set_video_backbone_mode(model, backbone_trainable=not freeze_backbone, finetune_mode=finetune_mode)
+            running_loss = 0.0
+            running_correct = 0
+            running_samples = 0
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            for clips, labels in train_loader:
+                clips = clips.to(DEVICE)
+                labels = labels.to(DEVICE)
+                optimizer.zero_grad(set_to_none=True)
+                amp_context = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+                with amp_context:
+                    logits = model(clips)
+                    loss = criterion(logits, labels)
 
-            preds = torch.argmax(logits.detach(), dim=1)
-            batch_size = labels.size(0)
-            running_loss += float(loss.item()) * batch_size
-            running_correct += int((preds == labels).sum().item())
-            running_samples += int(batch_size)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-        train_metrics = {
-            "loss": running_loss / max(1, running_samples),
-            "accuracy": running_correct / max(1, running_samples),
-        }
-        val_metrics = (
+                preds = torch.argmax(logits.detach(), dim=1)
+                batch_size = labels.size(0)
+                running_loss += float(loss.item()) * batch_size
+                running_correct += int((preds == labels).sum().item())
+                running_samples += int(batch_size)
+
+            train_metrics = {
+                "loss": running_loss / max(1, running_samples),
+                "accuracy": running_correct / max(1, running_samples),
+            }
+            val_metrics = (
+                _evaluate_video_entries(
+                    model,
+                    val_entries_for_split,
+                    clip_len=int(candidate["clip_len"]),
+                    stride=int(candidate["clip_stride"]),
+                    image_size=cfg.image_size,
+                    device=DEVICE,
+                    max_eval_clips=cfg.max_eval_clips,
+                )
+                if len(val_entries_for_split) > 0
+                else {"loss": 0.0, "accuracy": 0.0, "logits": None, "labels": None, "predictions": []}
+            )
+            scheduler.step(val_metrics["accuracy"])
+            monitor_metric = val_metrics["accuracy"] if len(val_entries_for_split) > 0 else train_metrics["accuracy"]
+            if monitor_metric > best_metric:
+                best_metric = monitor_metric
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_epoch = epoch
+                patience = 0
+            else:
+                patience += 1
+
+            history.append(
+                {
+                    "epoch": float(epoch),
+                    "train_loss": float(train_metrics["loss"]),
+                    "train_accuracy": float(train_metrics["accuracy"]),
+                    "val_loss": float(val_metrics["loss"]),
+                    "val_accuracy": float(val_metrics["accuracy"]),
+                }
+            )
+            if patience >= cfg.early_stop_patience:
+                break
+
+        if best_state is None:
+            raise RuntimeError("Training did not produce a valid model state.")
+
+        model.load_state_dict(best_state)
+        final_val_metrics = (
             _evaluate_video_entries(
                 model,
-                val_entries,
-                clip_len=cfg.clip_len,
-                stride=cfg.clip_stride,
+                val_entries_for_split,
+                clip_len=int(candidate["clip_len"]),
+                stride=int(candidate["clip_stride"]),
                 image_size=cfg.image_size,
                 device=DEVICE,
                 max_eval_clips=cfg.max_eval_clips,
             )
-            if len(val_entries) > 0
-            else {"loss": 0.0, "accuracy": 0.0, "logits": None, "labels": None, "predictions": []}
+            if val_entries_for_split
+            else {"logits": None, "labels": None, "predictions": []}
         )
-        scheduler.step(val_metrics["accuracy"])
+        val_logits = final_val_metrics.get("logits")
+        val_labels = final_val_metrics.get("labels")
+        return {
+            "member_seed": member_seed,
+            "candidate_name": str(candidate["name"]),
+            "clip_len": int(candidate["clip_len"]),
+            "clip_stride": int(candidate["clip_stride"]),
+            "learning_rate": learning_rate,
+            "history": history,
+            "best_accuracy": float(best_metric),
+            "best_epoch": int(best_epoch),
+            "temperature": _fit_temperature(val_logits, val_labels),
+            "reliability": _accuracy_to_reliability(best_metric),
+            "split_seed": int(member_seed),
+            "freeze_backbone": freeze_backbone,
+            "finetune_mode": finetune_mode,
+            "model_state": best_state,
+            "predictions": list(final_val_metrics.get("predictions") or []),
+            "prediction_records": list(final_val_metrics.get("prediction_records") or []),
+            "labels": val_labels.tolist() if val_labels is not None else [],
+        }
 
-        monitor_metric = val_metrics["accuracy"] if len(val_entries) > 0 else train_metrics["accuracy"]
-        if monitor_metric > best_metric:
-            best_metric = monitor_metric
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            patience = 0
-        else:
-            patience += 1
+    members: List[Dict[str, Any]] = []
+    candidate_results: List[Dict[str, Any]] = []
+    primary_train_entries: List[Dict[str, Any]] = []
+    primary_val_entries: List[Dict[str, Any]] = []
 
-        history.append(
+    for candidate_idx, candidate in enumerate(candidate_specs):
+        split_members: List[Dict[str, Any]] = []
+        for split_idx, split_seed in enumerate(split_seeds):
+            train_entries, val_entries = _split_entries(raw_entries, cfg.val_ratio, split_seed)
+            if not train_entries:
+                continue
+            if not primary_train_entries:
+                primary_train_entries = list(train_entries)
+                primary_val_entries = list(val_entries)
+            split_member = train_single_video_member(
+                cfg.seed + (candidate_idx * 101) + (split_idx * 13),
+                candidate,
+                train_entries_for_split=train_entries,
+                val_entries_for_split=val_entries,
+            )
+            split_member["eval_split_seed"] = int(split_seed)
+            split_members.append(split_member)
+            members.append(split_member)
+        if not split_members:
+            continue
+        candidate_results.append(
             {
-                "epoch": float(epoch),
-                "train_loss": float(train_metrics["loss"]),
-                "train_accuracy": float(train_metrics["accuracy"]),
-                "val_loss": float(val_metrics["loss"]),
-                "val_accuracy": float(val_metrics["accuracy"]),
+                "candidate": dict(candidate),
+                "split_members": split_members,
+                "mean_accuracy": float(np.mean([float(item["best_accuracy"]) for item in split_members])),
+                "std_accuracy": float(np.std([float(item["best_accuracy"]) for item in split_members])),
+                "mean_reliability": float(np.mean([float(item["reliability"]) for item in split_members])),
+                "primary_split_member": next(
+                    (item for item in split_members if int(item.get("eval_split_seed", -1)) == int(cfg.seed)),
+                    split_members[0],
+                ),
+                "best_split_member": max(split_members, key=lambda item: float(item["best_accuracy"])),
             }
         )
 
-        if patience >= cfg.early_stop_patience:
-            break
+    if not candidate_results or not primary_train_entries:
+        raise RuntimeError("Video ensemble training did not produce a valid model.")
 
-    if best_state is None:
-        raise RuntimeError("Training did not produce a valid model state.")
+    for result in candidate_results:
+        primary_acc = float(result["primary_split_member"]["best_accuracy"])
+        mean_acc = float(result["mean_accuracy"])
+        best_acc = float(result["best_split_member"]["best_accuracy"])
+        std_acc = float(result["std_accuracy"])
+        result["selection_score"] = (0.5 * primary_acc) + (0.35 * mean_acc) + (0.15 * best_acc) - (0.1 * std_acc)
 
-    model.load_state_dict(best_state)
-    final_val_metrics = (
-        _evaluate_video_entries(
-            model,
-            val_entries,
-            clip_len=cfg.clip_len,
-            stride=cfg.clip_stride,
-            image_size=cfg.image_size,
-            device=DEVICE,
-            max_eval_clips=cfg.max_eval_clips,
-        )
-        if val_entries
-        else {"logits": None, "labels": None, "predictions": []}
+    best_candidate = max(
+        candidate_results,
+        key=lambda item: (
+            float(item["selection_score"]),
+            float(item["primary_split_member"]["best_accuracy"]),
+            float(item["mean_accuracy"]),
+        ),
     )
-    val_logits = final_val_metrics.get("logits")
-    val_labels = final_val_metrics.get("labels")
-    temperature = _fit_temperature(val_logits, val_labels)
-    reliability = _accuracy_to_reliability(best_metric)
+    best_member = dict(best_candidate["primary_split_member"])
+    best_metric = float(best_candidate["primary_split_member"]["best_accuracy"])
+    reliability = float(best_candidate["mean_reliability"])
+
+    final_train_entries = maybe_filter_train_entries(str(best_member["candidate_name"]), raw_entries)
+    final_train_labels = [CLASS_TO_IDX[item["label"]] for item in final_train_entries]
+    final_dataset = VideoClipDataset(
+        final_train_entries,
+        clip_len=int(best_member["clip_len"]),
+        stride=int(best_member["clip_stride"]),
+        image_size=cfg.image_size,
+        train=True,
+        clips_per_video=cfg.train_clips_per_video,
+    )
+    final_loader = _make_loader(final_dataset, final_train_labels, cfg.batch_size, cfg.num_workers, train=True)
+    final_model = build_model(
+        pretrained=cfg.use_pretrained_backbone,
+        device=DEVICE,
+        freeze_backbone=bool(best_member["freeze_backbone"]),
+        finetune_mode=str(best_member["finetune_mode"]),
+    )
+    final_criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+    final_params = [param for param in final_model.parameters() if param.requires_grad]
+    final_optimizer = torch.optim.AdamW(final_params, lr=float(best_member["learning_rate"]), weight_decay=cfg.weight_decay)
+    final_use_amp = DEVICE == "cuda"
+    final_scaler = torch.cuda.amp.GradScaler(enabled=final_use_amp)
+
+    for _epoch in range(1, max(1, int(best_member.get("best_epoch", 1))) + 1):
+        final_model.train()
+        _set_video_backbone_mode(final_model, backbone_trainable=not bool(best_member["freeze_backbone"]), finetune_mode=str(best_member["finetune_mode"]))
+        for clips, labels in final_loader:
+            clips = clips.to(DEVICE)
+            labels = labels.to(DEVICE)
+            final_optimizer.zero_grad(set_to_none=True)
+            amp_context = torch.autocast(device_type="cuda", dtype=torch.float16) if final_use_amp else nullcontext()
+            with amp_context:
+                logits = final_model(clips)
+                loss = final_criterion(logits, labels)
+            final_scaler.scale(loss).backward()
+            final_scaler.step(final_optimizer)
+            final_scaler.update()
+
+    final_model_state = {k: v.detach().cpu().clone() for k, v in final_model.state_dict().items()}
 
     checkpoint = {
-        "checkpoint_format": "poseai_video_v2",
-        "model_name": "r3d_18" if r3d_18 is not None else "simple_3d_cnn",
+        "checkpoint_format": "poseai_video_v3",
+        "model_name": "r3d_18_ensemble" if r3d_18 is not None else "simple_3d_cnn_ensemble",
         "class_names": CLASS_NAMES,
         "class_to_idx": CLASS_TO_IDX,
-        "clip_len": cfg.clip_len,
-        "clip_stride": cfg.clip_stride,
+        "clip_len": int(best_member["clip_len"]),
+        "clip_stride": int(best_member["clip_stride"]),
         "image_size": cfg.image_size,
-        "temperature": temperature,
+        "temperature": float(best_member["temperature"]),
         "reliability": reliability,
         "use_pretrained_backbone": bool(cfg.use_pretrained_backbone and r3d_18 is not None),
-        "freeze_backbone": freeze_backbone,
+        "freeze_backbone": bool(best_member["freeze_backbone"]),
+        "finetune_mode": str(best_member.get("finetune_mode", cfg.video_finetune_mode)),
+        "selected_candidate": str(best_member.get("candidate_name", "baseline")),
         "device_trained": DEVICE,
         "trained_at": datetime.utcnow().isoformat() + "Z",
-        "train_videos": len(train_entries),
-        "val_videos": len(val_entries),
+        "train_videos": len(final_train_entries),
+        "val_videos": len(primary_val_entries),
         "video_counts": counts,
-        "history": history,
+        "history": [
+            {
+                "member_seed": member["member_seed"],
+                "candidate_name": member["candidate_name"],
+                "clip_len": member["clip_len"],
+                "clip_stride": member["clip_stride"],
+                "learning_rate": member["learning_rate"],
+                "eval_split_seed": member.get("eval_split_seed"),
+                "history": member["history"],
+                "best_accuracy": member["best_accuracy"],
+            }
+            for member in members
+        ],
+        "candidate_scores": [
+            {
+                "candidate_name": result["candidate"]["name"],
+                "clip_len": int(result["candidate"]["clip_len"]),
+                "clip_stride": int(result["candidate"]["clip_stride"]),
+                "learning_rate": float(result["candidate"]["learning_rate"]),
+                "primary_split_accuracy": float(result["primary_split_member"]["best_accuracy"]),
+                "best_split_accuracy": float(result["best_split_member"]["best_accuracy"]),
+                "mean_accuracy": float(result["mean_accuracy"]),
+                "std_accuracy": float(result["std_accuracy"]),
+                "mean_reliability": float(result["mean_reliability"]),
+                "selection_score": float(result["selection_score"]),
+                "splits_evaluated": len(result["split_members"]),
+            }
+            for result in candidate_results
+        ],
+        "cv_mean_accuracy": float(best_candidate["mean_accuracy"]),
+        "cv_std_accuracy": float(best_candidate["std_accuracy"]),
         "best_accuracy": best_metric,
-        "model_state": best_state,
+        "ensemble_members": len(members),
+        "members": [{**best_member, "model_state": final_model_state}],
     }
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, MODEL_PATH)
 
-    meta = {k: v for k, v in checkpoint.items() if k != "model_state"}
+    meta = {k: v for k, v in checkpoint.items() if k != "members"}
     MODEL_META_PATH.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
-    TRAINING_HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    TRAINING_HISTORY_PATH.write_text(json.dumps(checkpoint["history"], indent=2), encoding="utf-8")
+    suspicious_report = _build_suspicious_video_report(
+        raw_entries,
+        val_reports=best_member.get("prediction_records") or [],
+    )
     TRAINING_SUMMARY_PATH.write_text(
         json.dumps(
             {
                 "data_root": str(data_root),
-                "train_entries": train_entries,
-                "val_entries": val_entries,
+                "train_entries": primary_train_entries,
+                "val_entries": primary_val_entries,
                 "config": asdict(cfg),
                 "meta": meta,
+                "suspicious_videos": suspicious_report,
             },
             indent=2,
             default=str,
@@ -1850,7 +2305,7 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
     with open(TRAINING_CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fields)
         writer.writeheader()
-        for row in history:
+        for row in best_member["history"]:
             writer.writerow({k: row.get(k, "") for k in csv_fields})
 
     try:
@@ -1858,9 +2313,9 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        epochs_x = [int(r["epoch"]) for r in history]
-        train_acc = [float(r["train_accuracy"]) * 100 for r in history]
-        val_acc = [float(r["val_accuracy"]) * 100 for r in history]
+        epochs_x = [int(r["epoch"]) for r in best_member["history"]]
+        train_acc = [float(r["train_accuracy"]) * 100 for r in best_member["history"]]
+        val_acc = [float(r["val_accuracy"]) * 100 for r in best_member["history"]]
 
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(epochs_x, train_acc, marker="o", label="Train Accuracy", color="#4CAF50")
@@ -1878,15 +2333,14 @@ def run_training_pipeline(data_root: Optional[str | Path] = None) -> Path:
         pass
 
     if val_entries:
-        model.load_state_dict(best_state)
-        val_true = final_val_metrics["labels"].tolist() if final_val_metrics.get("labels") is not None else []
-        val_pred = list(final_val_metrics.get("predictions") or [])
+        val_true = list(best_member.get("labels") or [])
+        val_pred = list(best_member.get("predictions") or [])
         _save_summary_plot(
             all_true=val_true,
             all_pred=val_pred,
             class_names=CLASS_NAMES,
             best_metric=best_metric,
-            history=history,
+            history=best_member["history"],
             save_path=SUMMARY_PLOT_PATH,
         )
 

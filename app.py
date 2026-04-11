@@ -1,6 +1,7 @@
-
+﻿
 from __future__ import annotations
 
+import json
 import os
 import random
 import shutil
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import streamlit as st
 
-st.set_page_config(page_title="PoseAITraining", page_icon="🏋️", layout="centered")
+st.set_page_config(page_title="PoseAITraining", page_icon="נ‹ן¸", layout="centered")
 
 from backend import SquatAnalyzer, count_labeled_videos, download_gdrive_folder
 from main import (
@@ -189,16 +190,16 @@ def render_result(result: dict) -> None:
     model_sources = result.get("model_sources", [])
 
     is_good = prediction == "good"
-    title = "✅ Good squat" if is_good else "❌ Needs improvement"
+    title = "ג… Good squat" if is_good else "ג Needs improvement"
 
     if confidence_level == "high":
-        subtitle = f"Confidence: {confidence:.0%} • High reliability"
+        subtitle = f"Confidence: {confidence:.0%} ג€¢ High reliability"
         css_class = "good-card" if is_good else "bad-card"
     elif confidence_level == "medium":
-        subtitle = f"Confidence: {confidence:.0%} • Medium reliability"
+        subtitle = f"Confidence: {confidence:.0%} ג€¢ Medium reliability"
         css_class = "good-card" if is_good else "bad-card"
     else:
-        subtitle = f"Confidence: {confidence:.0%} • Borderline result"
+        subtitle = f"Confidence: {confidence:.0%} ג€¢ Borderline result"
         css_class = "warning-card"
 
     st.markdown(
@@ -272,6 +273,19 @@ def cleanup_old_outputs() -> None:
                 pass
 
 
+def load_training_summary() -> dict | None:
+    if not TRAINING_SUMMARY_PATH.exists():
+        return None
+    try:
+        return json.loads(TRAINING_SUMMARY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def render_suspicious_video_report(summary: dict | None) -> None:
+    return
+
+
 quotes = [
     "The only bad workout is the one that didn't happen.",
     "It never gets easier, you just get stronger.",
@@ -293,6 +307,7 @@ quotes = [
 render_logo()
 st.title("PoseAITraining")
 st.write("Upload your squat video and get one clear result with two short tips.")
+training_summary = load_training_summary()
 
 if not is_any_model_ready():
     st.info(
@@ -329,10 +344,7 @@ if not is_any_model_ready():
                     except Exception as dl_exc:
                         counts_check = count_labeled_videos(temp_gdrive) if temp_gdrive.exists() else {}
                         if counts_check.get("total", 0) >= 2:
-                            st.warning(
-                                f"Download stopped early ({dl_exc}), but enough files were found locally. "
-                                f"Training will continue on the downloaded subset."
-                            )
+                            pass
                         else:
                             raise RuntimeError(f"Download failed and not enough videos were saved: {dl_exc}")
 
@@ -403,11 +415,14 @@ else:
 if st.session_state.get("last_result"):
     render_result(st.session_state["last_result"])
 
+render_suspicious_video_report(training_summary)
+
 st.markdown(
     f"""
 <div class='quote-box'>
-    <h3 style='color: #72ffc1; font-style: italic; margin: 0; font-weight: 500;'>💪 "{random.choice(quotes)}"</h3>
+    <h3 style='color: #72ffc1; font-style: italic; margin: 0; font-weight: 500;'>נ’× "{random.choice(quotes)}"</h3>
 </div>
 """,
     unsafe_allow_html=True,
 )
+

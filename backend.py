@@ -43,6 +43,7 @@ from main import (
     load_video_clip,
     select_motion_focused_clip_starts,
     summarize_video_entries,
+    _tta_logits,
 )
 
 try:
@@ -93,7 +94,7 @@ def count_labeled_videos(data_root: str | Path) -> Dict[str, int]:
 
 def _load_checkpoint(model_path: str | Path) -> Dict[str, Any]:
     checkpoint = torch.load(str(model_path), map_location="cpu")
-    if isinstance(checkpoint, dict) and checkpoint.get("checkpoint_format") in {"poseai_video_v1", "poseai_video_v2"}:
+    if isinstance(checkpoint, dict) and checkpoint.get("checkpoint_format") in {"poseai_video_v1", "poseai_video_v2", "poseai_video_v3"}:
         return checkpoint
     raise RuntimeError(
         "The saved model is not a valid whole-video checkpoint. Please retrain with the updated video-based pipeline."
@@ -170,6 +171,9 @@ class PoseMetricsExtractor:
         knee_errors: List[float] = []
         depth_ratios: List[float] = []
         symmetry_scores: List[float] = []
+        edge_density_scores: List[float] = []
+        edge_change_scores: List[float] = []
+        prev_edges: Optional[np.ndarray] = None
 
         while True:
             ok, frame_bgr = cap.read()
@@ -180,6 +184,14 @@ class PoseMetricsExtractor:
                 continue
 
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 50, 150)
+            edge_density_scores.append(float(np.mean(edges > 0)))
+            if prev_edges is not None:
+                edge_change_scores.append(float(np.mean(edges != prev_edges)))
+            prev_edges = edges
             result = self.pose.process(frame_rgb)
             frames_seen += 1
             if not result.pose_landmarks:
@@ -235,6 +247,8 @@ class PoseMetricsExtractor:
             "mean_knee_tracking_error": float(np.mean(knee_errors)),
             "max_depth_ratio": float(np.max(depth_ratios)),
             "mean_left_right_depth_diff": float(np.mean(symmetry_scores)),
+            "mean_edge_density": float(np.mean(edge_density_scores)) if edge_density_scores else 0.0,
+            "mean_edge_change": float(np.mean(edge_change_scores)) if edge_change_scores else 0.0,
         }
 
 
@@ -244,6 +258,7 @@ class SquatAnalyzer:
         self.model_path = Path(model_path) if model_path is not None else MODEL_PATH
 
         self.model = None
+        self.video_members: List[Dict[str, Any]] = []
         self.checkpoint: Optional[Dict[str, Any]] = None
         self.model_temperature = 1.0
         self.clip_len = 24
@@ -339,18 +354,41 @@ class SquatAnalyzer:
                 self.image_size = int(checkpoint.get("image_size", 112))
                 self.model_temperature = float(checkpoint.get("temperature", 1.0) or 1.0)
 
-                m = build_model(
-                    pretrained=bool(checkpoint.get("use_pretrained_backbone", False)),
-                    device=self.device,
-                    freeze_backbone=bool(checkpoint.get("freeze_backbone", False)),
-                )
-                m.load_state_dict(checkpoint["model_state"])
-                m.eval()
-                self.model = m
+                self.video_members = []
+                member_payloads = checkpoint.get("members")
+                if isinstance(member_payloads, list) and member_payloads:
+                    for member_payload in member_payloads:
+                        m = build_model(
+                            pretrained=bool(checkpoint.get("use_pretrained_backbone", False)),
+                            device=self.device,
+                            freeze_backbone=bool(checkpoint.get("freeze_backbone", False)),
+                            finetune_mode=str(checkpoint.get("finetune_mode", "last_block")),
+                        )
+                        m.load_state_dict(member_payload["model_state"])
+                        m.eval()
+                        self.video_members.append(
+                            {
+                                "model": m,
+                                "temperature": float(member_payload.get("temperature", checkpoint.get("temperature", 1.0)) or 1.0),
+                                "reliability": float(member_payload.get("reliability", member_payload.get("best_accuracy", 0.7)) or 0.7),
+                            }
+                        )
+                    self.model = self.video_members[0]["model"]
+                else:
+                    m = build_model(
+                        pretrained=bool(checkpoint.get("use_pretrained_backbone", False)),
+                        device=self.device,
+                        freeze_backbone=bool(checkpoint.get("freeze_backbone", False)),
+                        finetune_mode=str(checkpoint.get("finetune_mode", "last_block")),
+                    )
+                    m.load_state_dict(checkpoint["model_state"])
+                    m.eval()
+                    self.model = m
                 self.is_loaded = True
             except Exception:
                 self.model = None
                 self.checkpoint = None
+                self.video_members = []
 
     def _select_clip_starts(self, total_frames: int) -> List[int]:
         return select_motion_focused_clip_starts(
@@ -448,8 +486,21 @@ class SquatAnalyzer:
                     start_idx=start,
                 ).unsqueeze(0)
                 clip = clip.to(self.device)
-                logits = self.model(clip)
-                probs = _softmax_with_temperature(logits, self.model_temperature).cpu().numpy()[0]
+                if self.video_members:
+                    member_probs: List[np.ndarray] = []
+                    member_weights: List[float] = []
+                    member_logits: List[torch.Tensor] = []
+                    for member in self.video_members:
+                        member_logit = _tta_logits(member["model"], clip)
+                        member_logits.append(member_logit.detach().cpu())
+                        member_prob = _softmax_with_temperature(member_logit, float(member.get("temperature", self.model_temperature))).cpu().numpy()[0]
+                        member_probs.append(member_prob)
+                        member_weights.append(max(0.01, _source_reliability({"reliability": member.get("reliability", 0.7)}, 0.7)))
+                    logits = torch.mean(torch.cat(member_logits, dim=0), dim=0, keepdim=True)
+                    probs = np.average(np.stack(member_probs, axis=0), axis=0, weights=np.array(member_weights, dtype=np.float32))
+                else:
+                    logits = _tta_logits(self.model, clip)
+                    probs = _softmax_with_temperature(logits, self.model_temperature).cpu().numpy()[0]
                 pred_idx = int(np.argmax(probs))
                 clip_votes.append(pred_idx)
                 logits_list.append(logits.detach().cpu())
@@ -503,7 +554,17 @@ class SquatAnalyzer:
         if not sources:
             return {"error": "Could not extract usable features from the uploaded video."}
 
-        weights = [max(0.01, float(src.get("weight_hint", 0.0))) for src in sources]
+        weights = [max(0.0, float(src.get("weight_hint", 0.0))) for src in sources]
+        if weights:
+            best_weight = max(weights)
+            min_keep = max(0.18, best_weight - 0.18)
+            strong_mask = [weight >= min_keep for weight in weights]
+            if best_weight >= 0.65 and sum(strong_mask) > 1:
+                strongest_idx = int(np.argmax(np.array(weights, dtype=np.float32)))
+                strong_mask = [idx == strongest_idx for idx in range(len(weights))]
+            if any(strong_mask):
+                sources = [src for src, keep in zip(sources, strong_mask) if keep]
+                weights = [weight for weight, keep in zip(weights, strong_mask) if keep]
         weight_sum = float(sum(weights))
         if weight_sum <= 1e-6:
             weights = [max(0.01, float(src.get("confidence", 0.5))) for src in sources]
