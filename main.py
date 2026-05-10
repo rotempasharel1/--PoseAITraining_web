@@ -426,6 +426,7 @@ def load_video_clip(
     """Load a whole-video clip tensor in C x T x H x W format."""
     video_path = str(video_path)
     
+    
     def _read_all_frames(path: str) -> List[np.ndarray]:
         cap_local = cv2.VideoCapture(path)
         frames_local: List[np.ndarray] = []

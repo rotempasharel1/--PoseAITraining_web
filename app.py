@@ -286,6 +286,7 @@ def render_suspicious_video_report(summary: dict | None) -> None:
     return
 
 
+
 quotes = [
     "The only bad workout is the one that didn't happen.",
     "It never gets easier, you just get stronger.",

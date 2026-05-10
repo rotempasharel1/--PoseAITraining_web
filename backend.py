@@ -266,6 +266,7 @@ class SquatAnalyzer:
         self.image_size = 112
         self._current_video_path = ""
 
+
         self.pose_gru: Optional[Any] = None
         self.pose_gru_meta: Optional[Dict[str, Any]] = None
         self.pose_gru_members: List[Dict[str, Any]] = []

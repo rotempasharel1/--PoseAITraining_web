@@ -13,6 +13,7 @@ The model only trains once. After training, the app switches automatically to an
 
 ---
 
+
 ## Project Structure
 
 ```
