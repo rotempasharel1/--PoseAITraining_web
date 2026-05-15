@@ -11,7 +11,7 @@ from pathlib import Path
 
 import streamlit as st
 
-st.set_page_config(page_title="PoseAITraining", page_icon="נ‹ן¸", layout="centered")
+st.set_page_config(page_title="PoseAITraining", page_icon="", layout="centered")
 
 from backend import SquatAnalyzer, count_labeled_videos, download_gdrive_folder
 from main import (
@@ -421,7 +421,7 @@ render_suspicious_video_report(training_summary)
 st.markdown(
     f"""
 <div class='quote-box'>
-    <h3 style='color: #72ffc1; font-style: italic; margin: 0; font-weight: 500;'>נ’× "{random.choice(quotes)}"</h3>
+    <h3 style='color: #72ffc1; font-style: italic; margin: 0; font-weight: 500;'>"{random.choice(quotes)}"</h3>
 </div>
 """,
     unsafe_allow_html=True,
