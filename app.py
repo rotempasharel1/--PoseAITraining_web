@@ -190,16 +190,16 @@ def render_result(result: dict) -> None:
     model_sources = result.get("model_sources", [])
 
     is_good = prediction == "good"
-    title = "ג… Good squat" if is_good else "ג Needs improvement"
+    title = "Good squat" if is_good else "Needs improvement"
 
     if confidence_level == "high":
-        subtitle = f"Confidence: {confidence:.0%} ג€¢ High reliability"
+        subtitle = f"Confidence: {confidence:.0%} High reliability"
         css_class = "good-card" if is_good else "bad-card"
     elif confidence_level == "medium":
-        subtitle = f"Confidence: {confidence:.0%} ג€¢ Medium reliability"
+        subtitle = f"Confidence: {confidence:.0%} Medium reliability"
         css_class = "good-card" if is_good else "bad-card"
     else:
-        subtitle = f"Confidence: {confidence:.0%} ג€¢ Borderline result"
+        subtitle = f"Confidence: {confidence:.0%} Borderline result"
         css_class = "warning-card"
 
     st.markdown(
