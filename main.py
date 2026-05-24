@@ -1283,39 +1283,39 @@ def _fallback_feedback(pred_label: str, confidence: float, metrics: Optional[Dic
     stability = metrics.get("torso_lean_std_deg")
 
     if max_depth_ratio is not None and max_depth_ratio >= 0.05:
-        keep_points.append("Nice squat depth through the bottom position.")
+        keep_points.append("עומק סקוואט מצוין, הגעת לטווח תנועה יפה בחלק התחתון.")
     if mean_torso_lean is not None and mean_torso_lean <= 30:
-        keep_points.append("Good chest position with controlled torso angle.")
+        keep_points.append("זווית גו מעולה, היית עם חזה פתוח ושליטה טובה בגב.")
     if knee_alignment is not None and knee_alignment <= 0.18:
-        keep_points.append("Good knee tracking over the feet.")
+        keep_points.append("הברכיים שלך עקבו בצורה טובה מאוד אחרי כפות הרגליים, ללא קריסה פנימה.")
     if symmetry is not None and symmetry <= 0.14:
-        keep_points.append("Both sides move with good symmetry.")
+        keep_points.append("חלוקת המשקל ותנועת שני צידי הגוף היו סימטריות ויציבות.")
     if stability is not None and stability <= 10:
-        keep_points.append("Your movement looks steady across the full repetition.")
+        keep_points.append("התנועה שלך נראתה יציבה וחלקה לאורך כל החזרה.")
 
     if max_depth_ratio is not None and max_depth_ratio < 0.0:
-        improve_points.append("Go slightly deeper so the hips reach at least knee level.")
+        improve_points.append("נסה לרדת קצת יותר נמוך, כך שהאגן יגיע לפחות לקו הברכיים.")
     if mean_torso_lean is not None and mean_torso_lean > 35:
-        improve_points.append("Keep your chest a bit prouder and reduce forward torso lean.")
+        improve_points.append("שים לב שהגוף שלך נוטה מדי קדימה, נסה להרים את החזה ולשמור על גב זקוף יותר.")
     if knee_alignment is not None and knee_alignment > 0.22:
-        improve_points.append("Keep your knees tracking more in line with your toes.")
+        improve_points.append("שים לב שהברכיים שלך קורסות - נסה לדחוף אותן החוצה כך שיהיו בקו אחד עם האצבעות.")
     if symmetry is not None and symmetry > 0.18:
-        improve_points.append("Try to keep both sides descending and rising more evenly.")
+        improve_points.append("הייתה קצת א-סימטריה בתנועה - נסה לרדת ולעלות בצורה מאוזנת על שתי הרגליים.")
     if stability is not None and stability > 12:
-        improve_points.append("Keep the descent and ascent steadier through the full video.")
+        improve_points.append("הירידה והעלייה שלך היו קצת חסרות יציבות, נסה לבצע את התנועה לאט ובשליטה רבה יותר.")
 
     if not keep_points:
         keep_points.append(
-            "Good overall control through parts of the squat cycle."
+            "הראית שליטה כללית טובה בחלקים מתנועת הסקוואט."
             if pred_label == "good"
-            else "You still show moments of useful control to build on."
+            else "יש עדיין רגעים של שליטה טובה בתנועה שאפשר לבנות עליהם."
         )
 
     if not improve_points:
         improve_points.append(
-            "Keep building consistency across the full squat from top to bottom."
+            "המשך לעבוד על עקביות ויציבות לאורך כל הטווח התנועתי של הסקוואט."
             if pred_label == "good"
-            else "Focus on a steadier, more aligned squat pattern across the full repetition."
+            else "התמקד בשמירה על יציבות ומנח גוף נכון יותר לאורך כל החזרה."
         )
 
     primary_keep_tip = keep_points[0]
@@ -1346,9 +1346,12 @@ def llm_feedback_for_row(
 
     try:
         system_msg = (
-            "You are a helpful squat coach. The classification was produced from a whole-video model and/or a pose-sequence model. "
-            "Return concise coaching feedback in English only. "
-            "You must explicitly mention KNEES and BACK/TORSO in the feedback."
+            "You are a professional, encouraging, and expert squat coach. "
+            "The classification was produced from a whole-video model and/or a pose-sequence model. "
+            "Return highly actionable, supportive, and specific coaching feedback in Hebrew. "
+            "Address the user directly. "
+            "You should mention the KNEES, BACK/TORSO, and DEPTH based on the provided metrics if they are notable. "
+            "The tone should be friendly, motivational, and professional."
         )
         metrics_text = json.dumps(metrics or {}, ensure_ascii=False)
         user_msg = f"""
