@@ -25,9 +25,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 try:
-    from openai import OpenAI
+    import google.generativeai as genai
 except Exception:  # pragma: no cover
-    OpenAI = None
+    genai = None
 
 try:
     from torchvision.models.video import r3d_18, R3D_18_Weights
@@ -152,21 +152,23 @@ set_seed(cfg.seed)
 
 
 # ============================================================
-# OpenAI feedback (optional)
+# Gemini feedback (optional)
 # ============================================================
-_OPENAI_CLIENT: Optional[Any] = None
+_GEMINI_CONFIGURED = False
 
-
-def _get_openai_client() -> Optional[Any]:
-    global _OPENAI_CLIENT
-    if OpenAI is None:
-        return None
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+def _configure_gemini() -> bool:
+    global _GEMINI_CONFIGURED
+    if genai is None:
+        return False
+    if _GEMINI_CONFIGURED:
+        return True
+    
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        return None
-    if _OPENAI_CLIENT is None:
-        _OPENAI_CLIENT = OpenAI(api_key=api_key)
-    return _OPENAI_CLIENT
+        return False
+    genai.configure(api_key=api_key)
+    _GEMINI_CONFIGURED = True
+    return True
 
 
 # ============================================================
@@ -1340,8 +1342,7 @@ def llm_feedback_for_row(
     metrics: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     fallback = _fallback_feedback(pred_label=pred_label, confidence=confidence, metrics=metrics)
-    client = _get_openai_client()
-    if client is None:
+    if not _configure_gemini():
         return fallback
 
     try:
@@ -1367,42 +1368,24 @@ Return strict JSON with these keys only:
 - llm_keep: 2 short points separated by ' ; '
 - llm_improve: 2 short points separated by ' ; '
 """
-
-        schema = {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "llm_keep": {"type": "string"},
-                "llm_improve": {"type": "string"},
-            },
-            "required": ["llm_keep", "llm_improve"],
-        }
-
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "squat_feedback",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=system_msg,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+            )
         )
-        data = json.loads(response.output_text)
-        keep_points = [part.strip() for part in data["llm_keep"].split(";") if part.strip()]
-        improve_points = [part.strip() for part in data["llm_improve"].split(";") if part.strip()]
+        response = model.generate_content(user_msg)
+        data = json.loads(response.text)
+        keep_points = [part.strip() for part in data.get("llm_keep", "").split(";") if part.strip()]
+        improve_points = [part.strip() for part in data.get("llm_improve", "").split(";") if part.strip()]
         if not keep_points:
             keep_points = fallback["keep_points"]
         if not improve_points:
             improve_points = fallback["improve_points"]
         return {
-            "llm_keep": data["llm_keep"],
-            "llm_improve": data["llm_improve"],
+            "llm_keep": data.get("llm_keep", ""),
+            "llm_improve": data.get("llm_improve", ""),
             "keep_points": keep_points,
             "improve_points": improve_points,
             "primary_keep_tip": keep_points[0],

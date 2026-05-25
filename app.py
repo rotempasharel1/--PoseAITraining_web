@@ -1,4 +1,4 @@
-﻿
+
 from __future__ import annotations
 
 import json
@@ -193,32 +193,22 @@ def render_result(result: dict) -> None:
     title = "Good squat" if is_good else "Needs improvement"
 
     if confidence_level == "high":
-        subtitle = f"Confidence: {confidence:.0%} High reliability"
         css_class = "good-card" if is_good else "bad-card"
     elif confidence_level == "medium":
-        subtitle = f"Confidence: {confidence:.0%} Medium reliability"
         css_class = "good-card" if is_good else "bad-card"
     else:
-        subtitle = f"Confidence: {confidence:.0%} Borderline result"
         css_class = "warning-card"
 
     st.markdown(
         f"""
         <div class="result-card {css_class}">
             <h2 style="margin:0;">{title}</h2>
-            <p style="margin:8px 0 0 0; font-size: 16px;">{subtitle}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    pill_html = ""
-    pill_html += f"<span class='stat-pill'>Agreement: {agreement:.0%}</span>"
-    pill_html += f"<span class='stat-pill'>Models: {', '.join(model_sources) if model_sources else model_name}</span>"
-    if result.get("clips_analyzed"):
-        pill_html += f"<span class='stat-pill'>Clips analyzed: {int(result['clips_analyzed'])}</span>"
 
-    st.markdown(pill_html, unsafe_allow_html=True)
 
     if confidence_level == "low":
         st.warning(
@@ -250,11 +240,7 @@ def render_result(result: dict) -> None:
 
     probs = result.get("probabilities", {})
     if probs:
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.metric("Good probability", f"{float(probs.get('good', 0.0)):.0%}")
-        with col_b:
-            st.metric("Bad probability", f"{float(probs.get('bad', 0.0)):.0%}")
+        st.metric("Level of accuracy", f"{float(probs.get('good', 0.0)):.0%}")
 
 def cleanup_old_outputs() -> None:
     for path in [

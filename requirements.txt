@@ -7,4 +7,4 @@ matplotlib
 gdown
 python-dotenv
 mediapipe
-openai
+google-generativeai
