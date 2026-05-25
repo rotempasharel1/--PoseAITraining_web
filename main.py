@@ -1365,8 +1365,8 @@ Context:
 
 Task:
 Return strict JSON with these keys only:
-- llm_keep: 2 short points separated by ' ; '
-- llm_improve: 2 short points separated by ' ; '
+- llm_keep: A detailed paragraph containing at least 2 descriptive sentences for positive feedback/what to keep doing.
+- llm_improve: A detailed paragraph containing at least 2 descriptive sentences for constructive feedback/what to improve.
 """
         model = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
@@ -1377,8 +1377,8 @@ Return strict JSON with these keys only:
         )
         response = model.generate_content(user_msg)
         data = json.loads(response.text)
-        keep_points = [part.strip() for part in data.get("llm_keep", "").split(";") if part.strip()]
-        improve_points = [part.strip() for part in data.get("llm_improve", "").split(";") if part.strip()]
+        keep_points = [data.get("llm_keep", "").strip()] if data.get("llm_keep", "").strip() else []
+        improve_points = [data.get("llm_improve", "").strip()] if data.get("llm_improve", "").strip() else []
         if not keep_points:
             keep_points = fallback["keep_points"]
         if not improve_points:
@@ -1392,7 +1392,10 @@ Return strict JSON with these keys only:
             "primary_improve_tip": improve_points[0],
             "confidence_note": fallback["confidence_note"],
         }
-    except Exception:
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"Gemini LLM error: {e}")
         return fallback
 
 
