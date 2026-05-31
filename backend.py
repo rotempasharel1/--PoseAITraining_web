@@ -597,6 +597,7 @@ class SquatAnalyzer:
             confidence=confidence,
             correct=True,
             metrics=metrics,
+            video_path=str(video_path),
         )
 
         model_sources = [src["name"] for src in sources]

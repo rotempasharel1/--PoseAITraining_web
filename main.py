@@ -1340,22 +1340,31 @@ def llm_feedback_for_row(
     confidence: float,
     correct: bool,
     metrics: Optional[Dict[str, float]] = None,
+    video_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     fallback = _fallback_feedback(pred_label=pred_label, confidence=confidence, metrics=metrics)
-    if not _configure_gemini():
-        return fallback
 
-    try:
-        system_msg = (
-            "You are a professional, encouraging, and expert squat coach. "
-            "The classification was produced from a whole-video model and/or a pose-sequence model. "
-            "Return highly actionable, supportive, and specific coaching feedback in Hebrew. "
-            "Address the user directly. "
-            "You should mention the KNEES, BACK/TORSO, and DEPTH based on the provided metrics if they are notable. "
-            "The tone should be friendly, motivational, and professional."
-        )
-        metrics_text = json.dumps(metrics or {}, ensure_ascii=False)
-        user_msg = f"""
+    img = None
+    if video_path and os.path.exists(video_path):
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        ok, frame = cap.read()
+        cap.release()
+        if ok:
+            from PIL import Image
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+
+    system_msg = (
+        "You are a professional, encouraging, and expert squat coach. "
+        "Identify if the person in the video frame (if provided) is a man or a woman, and adapt your language accordingly. "
+        "Write the main improvement and preservation feedback entirely in **English**. "
+        "Make the feedback VERY detailed, thick, and long (at least 3-4 descriptive sentences per section). "
+        "You MUST include enthusiastic English compliments matching their gender (e.g., 'Way to go, what a champion!', 'Great job, king!', 'Amazing work, queen!'). "
+        "You should mention the KNEES, BACK/TORSO, and DEPTH based on the provided metrics if they are notable. "
+    )
+    metrics_text = json.dumps(metrics or {}, ensure_ascii=False)
+    user_msg = f"""
 Context:
 - true_label: {true_label}
 - pred_label: {pred_label}
@@ -1365,39 +1374,78 @@ Context:
 
 Task:
 Return strict JSON with these keys only:
-- llm_keep: A detailed paragraph containing at least 2 descriptive sentences for positive feedback/what to keep doing.
-- llm_improve: A detailed paragraph containing at least 2 descriptive sentences for constructive feedback/what to improve.
+- llm_keep: A detailed paragraph containing at least 3-4 descriptive sentences for positive feedback/what to keep doing. Include a gender-appropriate English compliment.
+- llm_improve: A detailed paragraph containing at least 3-4 descriptive sentences for constructive feedback/what to improve. Include a gender-appropriate English compliment.
 """
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            system_instruction=system_msg,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-            )
-        )
-        response = model.generate_content(user_msg)
-        data = json.loads(response.text)
-        keep_points = [data.get("llm_keep", "").strip()] if data.get("llm_keep", "").strip() else []
-        improve_points = [data.get("llm_improve", "").strip()] if data.get("llm_improve", "").strip() else []
-        if not keep_points:
-            keep_points = fallback["keep_points"]
-        if not improve_points:
-            improve_points = fallback["improve_points"]
-        return {
-            "llm_keep": data.get("llm_keep", ""),
-            "llm_improve": data.get("llm_improve", ""),
-            "keep_points": keep_points,
-            "improve_points": improve_points,
-            "primary_keep_tip": keep_points[0],
-            "primary_improve_tip": improve_points[0],
-            "confidence_note": fallback["confidence_note"],
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"Gemini LLM error: {e}")
-        return fallback
 
+    if _configure_gemini():
+        try:
+            model = genai.GenerativeModel(
+                model_name="gemini-2.5-flash",
+                system_instruction=system_msg,
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                )
+            )
+            if img:
+                response = model.generate_content([user_msg, img])
+            else:
+                response = model.generate_content(user_msg)
+            data = json.loads(response.text)
+            keep_points = [data.get("llm_keep", "").strip()] if data.get("llm_keep", "").strip() else []
+            improve_points = [data.get("llm_improve", "").strip()] if data.get("llm_improve", "").strip() else []
+            if not keep_points:
+                keep_points = fallback["keep_points"]
+            if not improve_points:
+                improve_points = fallback["improve_points"]
+            return {
+                "llm_keep": data.get("llm_keep", ""),
+                "llm_improve": data.get("llm_improve", ""),
+                "keep_points": keep_points,
+                "improve_points": improve_points,
+                "primary_keep_tip": keep_points[0],
+                "primary_improve_tip": improve_points[0],
+                "confidence_note": fallback["confidence_note"],
+            }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Gemini LLM error: {e}")
+
+    # Fallback to Ollama
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=json.dumps({
+                "model": "gemma4:e2b",
+                "prompt": system_msg + "\n\n" + user_msg,
+                "stream": False,
+                "format": "json"
+            }).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+            data = json.loads(result.get("response", "{}"))
+            keep_points = [data.get("llm_keep", "").strip()] if data.get("llm_keep", "").strip() else []
+            improve_points = [data.get("llm_improve", "").strip()] if data.get("llm_improve", "").strip() else []
+            if not keep_points:
+                keep_points = fallback["keep_points"]
+            if not improve_points:
+                improve_points = fallback["improve_points"]
+            return {
+                "llm_keep": data.get("llm_keep", ""),
+                "llm_improve": data.get("llm_improve", ""),
+                "keep_points": keep_points,
+                "improve_points": improve_points,
+                "primary_keep_tip": keep_points[0],
+                "primary_improve_tip": improve_points[0],
+                "confidence_note": fallback["confidence_note"],
+            }
+    except Exception as oe:
+        print(f"Ollama Fallback error: {oe}")
+        return fallback
 
 # ============================================================
 # Pose-sequence model (side-view squat GRU classifier)
