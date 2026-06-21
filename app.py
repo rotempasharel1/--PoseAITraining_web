@@ -146,6 +146,16 @@ st.markdown(
         margin-bottom: 8px;
         font-size: 14px;
     }
+
+    div[data-testid="column"]:nth-child(1) button {
+        background-color: #2e7d32 !important;
+        border-color: #2e7d32 !important;
+        color: white !important;
+    }
+    
+    div[data-testid="column"]:nth-child(1) button * {
+        color: white !important;
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -370,37 +380,146 @@ if not is_any_model_ready():
             if training_succeeded and temp_gdrive.exists():
                 shutil.rmtree(temp_gdrive, ignore_errors=True)
 else:
-    uploaded_file = st.file_uploader("Upload squat video", type=["mp4", "mov", "avi", "mkv", "webm"])
+    tab_live, tab_upload = st.tabs(["Live Training", "Upload Video"])
+    
+    with tab_upload:
+        uploaded_file = st.file_uploader("Upload squat video", type=["mp4", "mov", "avi", "mkv", "webm"])
 
-    if uploaded_file is not None:
-        _, center_col, _ = st.columns([1, 2, 1])
-        with center_col:
-            st.video(uploaded_file)
+        if uploaded_file is not None:
+            _, center_col, _ = st.columns([1, 2, 1])
+            with center_col:
+                st.video(uploaded_file)
 
-        if st.button("Analyze video", type="primary", use_container_width=True):
-            temp_path = None
-            try:
-                analyzer = get_analyzer()
-                suffix = Path(uploaded_file.name).suffix or ".mp4"
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-                    temp_file.write(uploaded_file.getbuffer())
-                    temp_path = temp_file.name
+            if st.button("Analyze video", type="primary", use_container_width=True):
+                temp_path = None
+                try:
+                    analyzer = get_analyzer()
+                    suffix = Path(uploaded_file.name).suffix or ".mp4"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                        temp_file.write(uploaded_file.getbuffer())
+                        temp_path = temp_file.name
 
-                with st.spinner("Analyzing video..."):
-                    result = analyzer.analyze_video(temp_path)
+                    with st.spinner("Analyzing video..."):
+                        result = analyzer.analyze_video(temp_path)
 
-                if "error" in result:
-                    st.error(result["error"])
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        st.session_state["last_result"] = result
+                except Exception as exc:
+                    st.error(f"Analysis failed: {exc}")
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        os.unlink(temp_path)
+
+        if st.session_state.get("last_result"):
+            render_result(st.session_state["last_result"])
+            
+    with tab_live:
+        st.write("Live Training Mode: Do your squats in front of the camera. We'll automatically detect your reps and give you feedback!")
+        
+        if "live_running" not in st.session_state:
+            st.session_state.live_running = False
+            
+        col1, col2, _ = st.columns([1, 1, 2])
+        if col1.button("Start Live Training", type="primary", use_container_width=True):
+            st.session_state.live_running = True
+        if col2.button("Stop Live Training", type="primary", use_container_width=True):
+            st.session_state.live_running = False
+            if st.session_state.get("cap") is not None:
+                st.session_state.cap.release()
+                st.session_state.cap = None
+                
+        run_live = st.session_state.live_running
+        
+        if "cap" not in st.session_state:
+            st.session_state.cap = None
+            
+        if run_live:
+            if st.session_state.cap is None:
+                import cv2
+                st.session_state.cap = cv2.VideoCapture(0)
+                from live_tracker import SquatLiveTracker
+                st.session_state.tracker = SquatLiveTracker(get_analyzer())
+            
+            cap = st.session_state.cap
+            tracker = st.session_state.tracker
+            
+            col_video, col_feedback = st.columns([2, 1])
+            frame_placeholder = col_video.empty()
+            feedback_placeholder = col_feedback.empty()
+            
+            while run_live:
+                ret, frame = cap.read()
+                if not ret:
+                    st.error("Cannot access webcam.")
+                    break
+                    
+                frame = tracker.process_frame(frame)
+                frame_placeholder.image(frame, channels="BGR", use_container_width=True)
+                
+                fb = tracker.get_latest_feedback()
+                if fb and tracker.state == "IDLE":
+                    if "error" in fb:
+                        feedback_placeholder.error(fb["error"])
+                    else:
+                        keep_tip = fb.get("primary_keep_tip", "")
+                        improve_tip = fb.get("primary_improve_tip", "")
+                        prediction = fb.get('prediction', 'Unknown').capitalize()
+                        
+                        display_title = "Keep going!" if prediction == 'Good' else prediction
+                        
+                        html = f"""
+                        <div class="result-card {'good-card' if prediction=='Good' else 'bad-card'}">
+                            <h3 style="margin:0;">{display_title}</h3>
+                            <hr style="border-color: rgba(255,255,255,0.2);">
+                            <h5 style="color:#72ffc1;">Keep:</h5>
+                            <p style="font-size: 14px;">{keep_tip}</p>
+                            <h5 style="color:#ffd166;">Improve:</h5>
+                            <p style="font-size: 14px;">{improve_tip}</p>
+                        </div>
+                        """
+                        feedback_placeholder.markdown(html, unsafe_allow_html=True)
                 else:
-                    st.session_state["last_result"] = result
-            except Exception as exc:
-                st.error(f"Analysis failed: {exc}")
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.unlink(temp_path)
+                    feedback_placeholder.empty()
+                        
+        else:
+            if "tracker" in st.session_state and hasattr(st.session_state.tracker, "all_feedbacks") and st.session_state.tracker.all_feedbacks:
+                st.write("### Session Summary")
+                
+                from collections import Counter
+                keeps = [fb.get("primary_keep_tip", "") for fb in st.session_state.tracker.all_feedbacks if fb.get("primary_keep_tip")]
+                improves = [fb.get("primary_improve_tip", "") for fb in st.session_state.tracker.all_feedbacks if fb.get("primary_improve_tip")]
+                
+                if keeps and improves:
+                    common_keep = Counter(keeps).most_common(1)[0][0]
+                    common_improve = Counter(improves).most_common(1)[0][0]
+                    
+                    st.markdown(f"""
+                    <div style="background: rgba(255,255,255,0.1); padding: 15px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.3); margin-bottom: 20px;">
+                        <h4 style="margin-top:0; color:white;">Bottom Line</h4>
+                        <p style="font-size: 15px; margin-bottom: 6px;"><span style="color:#72ffc1; font-weight:bold;">To Keep:</span> {common_keep}</p>
+                        <p style="font-size: 15px; margin-bottom: 0;"><span style="color:#ffd166; font-weight:bold;">To Improve:</span> {common_improve}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                for i, fb in enumerate(st.session_state.tracker.all_feedbacks):
+                    keep_tip = fb.get("primary_keep_tip", "")
+                    improve_tip = fb.get("primary_improve_tip", "")
+                    prediction = fb.get('prediction', 'Unknown').capitalize()
+                    html = f"""
+                    <div class="result-card {'good-card' if prediction=='Good' else 'bad-card'}" style="margin-bottom: 10px;">
+                        <h4 style="margin:0;">Rep {i+1}</h4>
+                        <hr style="border-color: rgba(255,255,255,0.2); margin: 8px 0;">
+                        <p style="font-size: 14px; margin-bottom: 4px;"><span style="color:#72ffc1; font-weight:bold;">Keep:</span> {keep_tip}</p>
+                        <p style="font-size: 14px; margin-bottom: 0;"><span style="color:#ffd166; font-weight:bold;">Improve:</span> {improve_tip}</p>
+                    </div>
+                    """
+                    st.markdown(html, unsafe_allow_html=True)
 
-if st.session_state.get("last_result"):
-    render_result(st.session_state["last_result"])
+            if st.session_state.cap is not None:
+                st.session_state.cap.release()
+                st.session_state.cap = None
 
 render_suspicious_video_report(training_summary)
 

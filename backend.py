@@ -47,7 +47,27 @@ from main import (
 )
 
 try:
+    import cv2
     import mediapipe as mp
+    import mediapipe.python.solution_base as sb
+    import ctypes
+    import sys
+    import os
+
+    # Fix MediaPipe unicode path bug on Windows robustly
+    try:
+        buffer = ctypes.create_unicode_buffer(256)
+        ctypes.windll.kernel32.GetShortPathNameW(sys.executable, buffer, 256)
+        short_python = buffer.value
+        if short_python:
+            venv_dir = os.path.dirname(os.path.dirname(short_python))
+            sb_path = os.path.join(venv_dir, "Lib", "site-packages", "mediapipe", "python", "solution_base.py")
+            if os.path.exists(sb_path):
+                sb.__file__ = sb_path
+    except Exception:
+        pass
+
+    import pandas as pd
 except Exception:  # pragma: no cover
     mp = None
 

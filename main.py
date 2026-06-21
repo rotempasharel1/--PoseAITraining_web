@@ -1285,39 +1285,39 @@ def _fallback_feedback(pred_label: str, confidence: float, metrics: Optional[Dic
     stability = metrics.get("torso_lean_std_deg")
 
     if max_depth_ratio is not None and max_depth_ratio >= 0.05:
-        keep_points.append("עומק סקוואט מצוין, הגעת לטווח תנועה יפה בחלק התחתון.")
+        keep_points.append("Excellent squat depth, you reached a great range of motion at the bottom.")
     if mean_torso_lean is not None and mean_torso_lean <= 30:
-        keep_points.append("זווית גו מעולה, היית עם חזה פתוח ושליטה טובה בגב.")
+        keep_points.append("Great torso angle, you kept your chest open with good back control.")
     if knee_alignment is not None and knee_alignment <= 0.18:
-        keep_points.append("הברכיים שלך עקבו בצורה טובה מאוד אחרי כפות הרגליים, ללא קריסה פנימה.")
+        keep_points.append("Your knees tracked your feet perfectly without collapsing inward.")
     if symmetry is not None and symmetry <= 0.14:
-        keep_points.append("חלוקת המשקל ותנועת שני צידי הגוף היו סימטריות ויציבות.")
+        keep_points.append("Your weight distribution and body movement were very symmetrical and stable.")
     if stability is not None and stability <= 10:
-        keep_points.append("התנועה שלך נראתה יציבה וחלקה לאורך כל החזרה.")
+        keep_points.append("Your movement looked very stable and smooth throughout the repetition.")
 
     if max_depth_ratio is not None and max_depth_ratio < 0.0:
-        improve_points.append("נסה לרדת קצת יותר נמוך, כך שהאגן יגיע לפחות לקו הברכיים.")
+        improve_points.append("Try to go a bit lower, so your hips reach at least knee level.")
     if mean_torso_lean is not None and mean_torso_lean > 35:
-        improve_points.append("שים לב שהגוף שלך נוטה מדי קדימה, נסה להרים את החזה ולשמור על גב זקוף יותר.")
+        improve_points.append("Notice that your body leans too far forward, try to lift your chest and keep your back straighter.")
     if knee_alignment is not None and knee_alignment > 0.22:
-        improve_points.append("שים לב שהברכיים שלך קורסות - נסה לדחוף אותן החוצה כך שיהיו בקו אחד עם האצבעות.")
+        improve_points.append("Notice that your knees are caving in - try to push them outwards so they align with your toes.")
     if symmetry is not None and symmetry > 0.18:
-        improve_points.append("הייתה קצת א-סימטריה בתנועה - נסה לרדת ולעלות בצורה מאוזנת על שתי הרגליים.")
+        improve_points.append("There was some asymmetry in your movement - try to descend and ascend balanced on both legs.")
     if stability is not None and stability > 12:
-        improve_points.append("הירידה והעלייה שלך היו קצת חסרות יציבות, נסה לבצע את התנועה לאט ובשליטה רבה יותר.")
+        improve_points.append("Your descent and ascent were a bit unstable, try performing the movement slower and with more control.")
 
     if not keep_points:
         keep_points.append(
-            "הראית שליטה כללית טובה בחלקים מתנועת הסקוואט."
+            "You showed good overall control in parts of the squat movement."
             if pred_label == "good"
-            else "יש עדיין רגעים של שליטה טובה בתנועה שאפשר לבנות עליהם."
+            else "There are still moments of good control in the movement that can be built upon."
         )
 
     if not improve_points:
         improve_points.append(
-            "המשך לעבוד על עקביות ויציבות לאורך כל הטווח התנועתי של הסקוואט."
+            "Keep working on consistency and stability throughout the full range of motion of the squat."
             if pred_label == "good"
-            else "התמקד בשמירה על יציבות ומנח גוף נכון יותר לאורך כל החזרה."
+            else "Focus on maintaining better stability and body posture throughout the entire repetition."
         )
 
     primary_keep_tip = keep_points[0]
@@ -1344,22 +1344,28 @@ def llm_feedback_for_row(
 ) -> Dict[str, Any]:
     fallback = _fallback_feedback(pred_label=pred_label, confidence=confidence, metrics=metrics)
 
-    img = None
+    imgs = []
     if video_path and os.path.exists(video_path):
         import cv2
+        from PIL import Image
         cap = cv2.VideoCapture(video_path)
-        ok, frame = cap.read()
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total_frames > 0:
+            indices = [0, total_frames//3, (total_frames*2)//3, total_frames-1]
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, frame = cap.read()
+                if ok:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    imgs.append(Image.fromarray(frame_rgb))
         cap.release()
-        if ok:
-            from PIL import Image
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame_rgb)
 
     system_msg = (
         "You are a professional, encouraging, and expert squat coach. "
         "Identify if the person in the video frame (if provided) is a man or a woman, and adapt your language accordingly. "
-        "Write the main improvement and preservation feedback entirely in **English**. "
-        "Make the feedback VERY detailed, thick, and long (at least 3-4 descriptive sentences per section). "
+        "If the user is performing a movement that is CLEARLY NOT A SQUAT (e.g., just bending their back like a good-morning, or doing jumping jacks), explicitly tell them they are not performing a squat correctly, and explain what they need to fix to do a proper squat instead. "
+        "Write the main improvement and preservation feedback entirely in **English**. DO NOT USE HEBREW UNDER ANY CIRCUMSTANCES. STRICTLY ENGLISH ONLY. "
+        "Make the feedback VERY short, concise, and punchy (exactly 1 sentence per section). "
         "You MUST include enthusiastic English compliments matching their gender (e.g., 'Way to go, what a champion!', 'Great job, king!', 'Amazing work, queen!'). "
         "You should mention the KNEES, BACK/TORSO, and DEPTH based on the provided metrics if they are notable. "
     )
@@ -1374,8 +1380,8 @@ Context:
 
 Task:
 Return strict JSON with these keys only:
-- llm_keep: A detailed paragraph containing at least 3-4 descriptive sentences for positive feedback/what to keep doing. Include a gender-appropriate English compliment.
-- llm_improve: A detailed paragraph containing at least 3-4 descriptive sentences for constructive feedback/what to improve. Include a gender-appropriate English compliment.
+- llm_keep: A short, 1-sentence positive feedback/what to keep doing. Include a gender-appropriate English compliment.
+- llm_improve: A short, 1-sentence constructive feedback/what to improve. Include a gender-appropriate English compliment.
 """
 
     if _configure_gemini():
@@ -1387,8 +1393,8 @@ Return strict JSON with these keys only:
                     response_mime_type="application/json",
                 )
             )
-            if img:
-                response = model.generate_content([user_msg, img])
+            if imgs:
+                response = model.generate_content([user_msg] + imgs)
             else:
                 response = model.generate_content(user_msg)
             data = json.loads(response.text)
